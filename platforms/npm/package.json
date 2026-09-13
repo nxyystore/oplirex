@@ -1,10 +1,10 @@
 {
   "name": "oplirex",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "description": "OpenCode Limit Reset + Anthropic Proxy Bridge",
   "bin": {
-    "oplirex": "./bin/oplirex.js",
-    "oplire": "./bin/oplirex.js"
+    "oplirex": "bin/oplirex.js",
+    "oplire": "bin/oplirex.js"
   },
   "files": [
     "bin/"
@@ -20,7 +20,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nxyystore/oplirex.git"
+    "url": "git+https://github.com/nxyystore/oplirex.git"
   },
   "homepage": "https://github.com/nxyystore/oplirex",
   "engines": {

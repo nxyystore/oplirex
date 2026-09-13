@@ -3,15 +3,15 @@ PackageVersion: 1.0.0
 PackageName: oplirex
 PackageDescription: OpenCode limit reset and Anthropic proxy bridge with WARP recovery
 Publisher: nxyy
-PublisherUrl: https://github.com/nxyystore/oplire
+PublisherUrl: https://github.com/nxyystore/oplirex
 Author: nxyy
 License: MIT
-LicenseUrl: https://github.com/nxyystore/oplire/blob/main/LICENSE
+LicenseUrl: https://github.com/nxyystore/oplirex/blob/main/LICENSE
 ShortDescription: OpenCode limit reset via WARP tunnel
-PackageUrl: https://github.com/nxyystore/oplire
+PackageUrl: https://github.com/nxyystore/oplirex
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/nxyystore/oplire/releases/download/v1.0.0/oplirex-windows.msi
+    InstallerUrl: https://github.com/nxyystore/oplirex/releases/download/v1.0.0/oplirex-windows.msi
     InstallerSha256: REPLACEME
     ReleaseDate: 2026-09-12
     Scope: machine

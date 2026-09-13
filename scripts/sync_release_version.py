@@ -21,7 +21,7 @@ HOMEBREW = ROOT / "platforms" / "homebrew" / "oplirex.rb"
 README = ROOT / "README.md"
 
 OWNER = "nxyystore"
-REPO = "oplire"
+REPO = "oplirex"
 PACKAGE_ID = "nxyy.oplirex"
 PACKAGE_NAME = "oplirex"
 PUBLISHER = "nxyy"

@@ -9,11 +9,11 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![AUR](https://img.shields.io/badge/AUR-1.0.0-blue?style=flat-square)](https://aur.archlinux.org/packages/oplire)
+[![AUR](https://img.shields.io/badge/AUR-1.0.0-blue?style=flat-square)](https://aur.archlinux.org/packages/oplirex)
 
-## What is oplire?
+## What is oplirex?
 
-**oplire** is a dual-purpose tool:
+**oplirex** is a dual-purpose tool:
 
 1. **WARP Rate Limit Reset** - Rotates your IP via Cloudflare WARP to reset OpenCode rate limits
 2. **Anthropic Proxy Bridge** - Reverse proxy that connects Claude Code to OpenCode Zen's free models with automatic rate limit recovery
@@ -179,7 +179,7 @@ Language: Rust
 Purpose: OpenCode rate limit reset + Anthropic proxy
 Infrastructure: Cloudflare WARP + Axum HTTP
 Author: nxyy
-GitHub: https://github.com/nxyystore/oplire
+GitHub: https://github.com/nxyystore/oplirex
 ```
 
 ## License

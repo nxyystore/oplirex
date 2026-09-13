@@ -29,16 +29,27 @@ jobs:
 
   npm:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # OIDC for npm trusted publishing + provenance
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20, registry-url: 'https://registry.npmjs.org' }
-      - working-directory: platforms/npm
+      - name: Update npm version from tag
+        shell: bash
         run: |
-          npm install --package-lock-only || true
-          npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VER="${GITHUB_REF_NAME#v}"
+          VER="${VER:-${{ github.event.inputs.version }}}"
+          VER="${VER#v}"
+          if [ -n "$VER" ]; then
+            echo "Setting npm version to $VER"
+            npm --prefix platforms/npm version "$VER" --no-git-tag-version --allow-same-version || \
+              python3 -c "import json,pathlib; p=pathlib.Path('platforms/npm/package.json'); d=json.loads(p.read_text()); d['version']='$VER'; p.write_text(json.dumps(d, indent=2)+'\n')"
+          fi
+          cat platforms/npm/package.json | grep version
+      - working-directory: platforms/npm
+        run: npm publish --provenance --access public
 
   winget:
     runs-on: ubuntu-latest

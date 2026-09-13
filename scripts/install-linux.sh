@@ -55,9 +55,9 @@ install_oplirex() {
   esac
 
   if [[ "$VERSION" == "latest" ]]; then
-    URL="https://github.com/nxyystore/oplire/releases/latest/download/oplirex-${ARCH_TAG}.tar.gz"
+    URL="https://github.com/nxyystore/oplirex/releases/latest/download/oplirex-${ARCH_TAG}.tar.gz"
   else
-    URL="https://github.com/nxyystore/oplire/releases/download/${VERSION}/oplirex-${ARCH_TAG}.tar.gz"
+    URL="https://github.com/nxyystore/oplirex/releases/download/${VERSION}/oplirex-${ARCH_TAG}.tar.gz"
   fi
 
   # Try distro-native package first

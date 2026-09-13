@@ -6,7 +6,7 @@ const { homedir, platform, arch } = require("os");
 const https = require("https");
 
 const VERSION = require("../package.json").version;
-const REPO = "nxyystore/oplire";
+const REPO = "nxyystore/oplirex";
 
 function getAsset() {
     const p = platform();

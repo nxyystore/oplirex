@@ -31,9 +31,9 @@ function Install-Oplirex {
 
     $tag = if ($Version -eq "latest") { "latest/download" } else { "download/$Version" }
     # Prefer MSI if available, fallback to exe zip
-    $msiUrl = "https://github.com/nxyystore/oplire/releases/$tag/oplirex-windows-x86_64.msi"
-    $zipUrl = "https://github.com/nxyystore/oplire/releases/$tag/oplirex-windows-x86_64.zip"
-    $exeUrl = "https://github.com/nxyystore/oplire/releases/$tag/oplirex-windows-x86_64.exe"
+    $msiUrl = "https://github.com/nxyystore/oplirex/releases/$tag/oplirex-windows-x86_64.msi"
+    $zipUrl = "https://github.com/nxyystore/oplirex/releases/$tag/oplirex-windows-x86_64.zip"
+    $exeUrl = "https://github.com/nxyystore/oplirex/releases/$tag/oplirex-windows-x86_64.exe"
 
     $tmp = Join-Path $env:TEMP "oplirex-install"
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
