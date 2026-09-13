@@ -1,166 +1,91 @@
-name: Build and Release
+name: Build
 
 on:
   push:
     tags: ["v*"]
   pull_request:
-    branches: [main, master]
+    branches: [master, main]
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag to publish, e.g. v1.0.0"
+        description: "v1.0.0"
         required: false
         default: ""
   workflow_run:
-    workflows: ["Auto Tag on Release Commit"]
+    workflows: ["Auto Tag"]
     types: [completed]
 
 env:
   CARGO_TERM_COLOR: always
-
 permissions:
   contents: write
 
 jobs:
   build:
-    # allow workflow_run trigger to build even when autotag used GITHUB_TOKEN (tag pushes with GITHUB_TOKEN don't trigger push tag)
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: oplirex
-            ext: ""
-            os_name: linux-x86_64
-            cross: false
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: oplirex.exe
-            ext: ".exe"
-            os_name: windows-x86_64
-            cross: false
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary: oplirex
-            ext: ""
-            os_name: macos-x86_64
-            cross: false
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary: oplirex
-            ext: ""
-            os_name: macos-arm64
-            cross: false
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            binary: oplirex
-            ext: ""
-            os_name: linux-aarch64
-            cross: false
-
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, os_name: linux-x86_64, ext: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, os_name: windows-x86_64, ext: ".exe" }
+          - { os: macos-latest, target: x86_64-apple-darwin, os_name: macos-x86_64, ext: "" }
+          - { os: macos-latest, target: aarch64-apple-darwin, os_name: macos-arm64, ext: "" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, os_name: linux-aarch64, ext: "" }
     steps:
       - uses: actions/checkout@v4
         with:
-          # for workflow_run, checkout the tag that autotag just created (if any)
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || '' }}
           fetch-depth: 0
-
-      - name: Resolve tag for workflow_run trigger
-        if: github.event_name == 'workflow_run'
-        shell: bash
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || '' }}
+      - if: github.event_name == 'workflow_run'
         run: |
           git fetch --tags --force
           TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          echo "Resolved tag $TAG for workflow_run"
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          if [ -n "$TAG" ]; then git checkout "$TAG" || git checkout "origin/${{ github.event.workflow_run.head_branch }}" ; fi
-          echo "Now on $(git rev-parse --abbrev-ref HEAD 2>/dev/null || git describe --tags)"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+          [ -n "$TAG" ] && git checkout "$TAG" || true
+        shell: bash
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package artifact (Unix)
-        if: matrix.os != 'windows-latest'
-        shell: bash
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - shell: bash
         run: |
           mkdir -p release
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "release/oplirex-${{ matrix.os_name }}${{ matrix.ext }}"
-          # Also create tar.gz for generic Linux/macOS installs
-          tar czf "release/oplirex-${{ matrix.os_name }}.tar.gz" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}"
-          sha256sum release/* > release/SHA256SUMS-${{ matrix.os_name }}.txt || shasum -a 256 release/* > release/SHA256SUMS-${{ matrix.os_name }}.txt
-          ls -lh release/
-
-      - name: Package artifact (Windows)
-        if: matrix.os == 'windows-latest'
+          BIN=oplirex${{ matrix.ext }}
+          cp target/${{ matrix.target }}/release/$BIN release/oplirex-${{ matrix.os_name }}${{ matrix.ext }}
+          cd release && tar czf oplirex-${{ matrix.os_name }}.tar.gz oplirex-${{ matrix.os_name }}${{ matrix.ext }} 2>/dev/null || 7z a oplirex-${{ matrix.os_name }}.zip oplirex-${{ matrix.os_name }}${{ matrix.ext }} >/dev/null
+          sha256sum * > SHA256SUMS-${{ matrix.os_name }}.txt 2>/dev/null || shasum -a 256 * > SHA256SUMS-${{ matrix.os_name }}.txt
+      - if: matrix.os == 'windows-latest' && hashFiles('platforms/windows/oplire.wxs') != ''
         shell: bash
         run: |
-          mkdir -p release
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "release/oplirex-${{ matrix.os_name }}${{ matrix.ext }}"
-          # Zip for scoop/choco/npm generic
-          cd release && 7z a "oplirex-${{ matrix.os_name }}.zip" "oplirex-${{ matrix.os_name }}${{ matrix.ext }}" || powershell Compress-Archive -Path "oplirex-${{ matrix.os_name }}${{ matrix.ext }}" -DestinationPath "oplirex-${{ matrix.os_name }}.zip"
-          sha256sum * > SHA256SUMS-${{ matrix.os_name }}.txt || shasum -a 256 * > SHA256SUMS-${{ matrix.os_name }}.txt
-          ls -lh
-
-      - name: Build MSI (Windows only)
-        if: matrix.os == 'windows-latest'
-        shell: bash
-        run: |
-          # WiX MSI via cargo-wix (optional — skips if wix file missing)
-          if [ -f platforms/windows/oplire.wxs ]; then
-            cargo install cargo-wix --locked || true
-            cargo wix --nocapture --target ${{ matrix.target }} 2>&1 | tail -30 || echo "cargo wix not configured — skipping MSI"
-            find target -name "*.msi" -exec cp {} release/ \; 2>/dev/null || true
-          fi
-          ls -lh release/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          cargo install cargo-wix --locked || true
+          cargo wix --nocapture --target ${{ matrix.target }} || true
+          find target -name "*.msi" -exec cp {} release/ \; 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
         with:
           name: oplirex-${{ matrix.os_name }}
           path: release/*
-          if-no-files-found: error
 
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run'
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: release
           pattern: oplirex-*
           merge-multiple: true
-
-      - name: Generate combined SHA256SUMS
-        shell: bash
-        run: |
+      - run: |
           cd release
-          cat SHA256SUMS-*.txt 2>/dev/null > SHA256SUMS.txt || sha256sum * > SHA256SUMS.txt || shasum -a 256 * > SHA256SUMS.txt
-          # Update winget/scoop/choco hashes placeholder is done post-release via publish workflows
+          cat SHA256SUMS-*.txt 2>/dev/null > SHA256SUMS.txt || sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
-          find . -maxdepth 2 -type f | sort
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        shell: bash
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name || github.event.inputs.version }}
-          name: ${{ github.ref_name || github.event.inputs.version }}
           files: release/**/*
-          draft: false
-          prerelease: ${{ contains(github.ref_name || github.event.inputs.version, 'beta') || contains(github.ref_name || github.event.inputs.version, 'rc') }}
           generate_release_notes: true
-          fail_on_unmatched_files: false

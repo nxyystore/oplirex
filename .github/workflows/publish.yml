@@ -1,4 +1,4 @@
-name: Publish Packages
+name: Publish
 
 on:
   release:
@@ -8,18 +8,17 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Tag e.g. v2.4.1"
+        description: "v1.0.0"
         required: false
         default: ""
 
 permissions:
   contents: write
-  id-token: write  # for npm provenance, trusted publishing
+  id-token: write
 
 jobs:
   crates:
     runs-on: ubuntu-latest
-    if: github.event_name != 'release' || github.event.release.prerelease == false
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,172 +28,105 @@ jobs:
 
   npm:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write  # OIDC for npm trusted publishing + provenance
+    permissions: { contents: read, id-token: write }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20, registry-url: 'https://registry.npmjs.org' }
-      - name: Update npm version from tag
+        with: { node-version: 20, registry-url: https://registry.npmjs.org }
+      - run: |
+          VER=${GITHUB_REF_NAME#v}; VER=${VER:-${{ github.event.inputs.version }}}; VER=${VER#v}
+          [ -n "$VER" ] && npm --prefix platforms/npm version "$VER" --no-git-tag-version --allow-same-version || true
         shell: bash
-        run: |
-          VER="${GITHUB_REF_NAME#v}"
-          VER="${VER:-${{ github.event.inputs.version }}}"
-          VER="${VER#v}"
-          if [ -n "$VER" ]; then
-            echo "Setting npm version to $VER"
-            npm --prefix platforms/npm version "$VER" --no-git-tag-version --allow-same-version || \
-              python3 -c "import json,pathlib; p=pathlib.Path('platforms/npm/package.json'); d=json.loads(p.read_text()); d['version']='$VER'; p.write_text(json.dumps(d, indent=2)+'\n')"
-          fi
-          cat platforms/npm/package.json | grep version
       - working-directory: platforms/npm
         run: npm publish --provenance --access public
-
-  winget:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Update winget manifest hash
-        run: |
-          VER=${GITHUB_REF_NAME#v}
-          VER=${VER:-${{ github.event.inputs.version }}}
-          VER=${VER#v}
-          # fetch SHA from release SHA256SUMS if available
-          echo "Winget publish: version $VER"
-          # This workflow pushes to winget-pkgs via Releaser; hash is resolved there
-          echo "version=$VER" >> $GITHUB_OUTPUT
-        id: ver
-      - uses: vedantmgoyal2009/winget-releaser@main
-        with:
-          identifier: nxyy.oplirex
-          version: ${{ steps.ver.outputs.version }}
-          installers-regex: 'oplirex-windows.*\.(msi|exe)$'
-          token: ${{ secrets.WINGET_TOKEN }}
 
   scoop:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Update scoop bucket
-        env:
+      - env:
           GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
         run: |
           VER=${GITHUB_REF_NAME#v}; VER=${VER#v}
-          # if scoop-bucket repo exists, push updated json; otherwise skip
-          if gh repo view nxyystore/scoop-bucket >/dev/null 2>&1; then
-            gh repo clone nxyystore/scoop-bucket /tmp/scoop-bucket
-            # fetch hash from release
-            HASH=$(curl -fsSL "https://github.com/nxyystore/oplirex/releases/download/v$VER/SHA256SUMS.txt" 2>/dev/null | grep "windows.*zip" | awk '{print $1}' || echo "REPLACEME")
-            sed -i "s/\"hash\": \".*\"/\"hash\": \"$HASH\"/" platforms/scoop/oplirex.json
-            cp platforms/scoop/oplirex.json /tmp/scoop-bucket/bucket/oplirex.json
-            cd /tmp/scoop-bucket && git config user.name "github-actions[bot]" && git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add bucket/oplirex.json && git diff --cached --quiet || (git commit -m "oplirex v$VER" && git push)
-          else
-            echo "scoop-bucket repo not found — create nxyystore/scoop-bucket with bucket/oplirex.json first (see docs)"
-          fi
+          gh repo view nxyystore/scoop-bucket >/dev/null 2>&1 || exit 0
+          gh repo clone nxyystore/scoop-bucket /tmp/b
+          HASH=$(curl -fsSL https://github.com/nxyystore/oplirex/releases/download/v$VER/SHA256SUMS.txt 2>/dev/null | grep "windows.*zip" | awk '{print $1}')
+          [ -n "$HASH" ] && sed -i "s/\"hash\": \".*\"/\"hash\": \"$HASH\"/" platforms/scoop/oplirex.json
+          cp platforms/scoop/oplirex.json /tmp/b/bucket/oplirex.json
+          cd /tmp/b && git config user.name "github-actions[bot]" && git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/oplirex.json && git diff --cached --quiet || git commit -m "oplirex v$VER" && git push
+        shell: bash
 
-  chocolatey:
+  choco:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Inject SHA256 into chocolateyinstall.ps1
-        shell: pwsh
+      - shell: pwsh
         run: |
-          $ver = "${{ github.ref_name }}".TrimStart('v')
-          if (-not $ver) { $ver = "${{ github.event.inputs.version }}".TrimStart('v') }
-          if (-not $ver) { $ver = (Get-Content platforms/chocolatey/oplirex.nuspec | Select-String '<version>(.*)</version>').Matches.Groups[1].Value }
-          Write-Host "Fetching SHA for v$ver"
-          $shaUrl = "https://github.com/nxyystore/oplirex/releases/download/v$ver/SHA256SUMS.txt"
-          $hash = ""
-          try {
-            $txt = Invoke-RestMethod -Uri $shaUrl -TimeoutSec 30
-            $line = ($txt -split "`n" | Where-Object { $_ -match "windows.*zip" } | Select-Object -First 1)
-            if ($line) { $hash = ($line -split '\s+')[0] }
-          } catch { Write-Host "SHA fetch failed: $_" }
-          if (-not $hash -or $hash -eq "REPLACEME") {
-            Write-Host "::warning::SHA not found, leaving REPLACEME — choco install will skip verification"
-          } else {
-            Write-Host "Injecting hash $hash"
-            (Get-Content platforms/chocolatey/tools/chocolateyinstall.ps1) -replace "checksum64\s*=\s*'[^']+'", "checksum64 = '$hash'" | Set-Content platforms/chocolatey/tools/chocolateyinstall.ps1
-            (Get-Content platforms/chocolatey/tools/chocolateyinstall.ps1) -replace 'checksum64\s*=\s*"[^"]+"', "checksum64 = `"$hash`"" | Set-Content platforms/chocolatey/tools/chocolateyinstall.ps1
-            Get-Content platforms/chocolatey/tools/chocolateyinstall.ps1
-          }
-          echo "VER=$ver" >> $env:GITHUB_ENV
-      - name: Push to Chocolatey
-        run: |
-          choco pack platforms/chocolatey/oplirex.nuspec --version $env:VER
-          choco push "oplirex.$env:VER.nupkg" --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+          $v="${{ github.ref_name }}".TrimStart('v'); if(-not $v){$v="${{ github.event.inputs.version }}".TrimStart('v')}
+          $h=""; try{$t=Invoke-RestMethod "https://github.com/nxyystore/oplirex/releases/download/v$v/SHA256SUMS.txt" -TimeoutSec 30; $l=$t -split "`n" | ?{$_ -match "windows.*zip"} | select -First 1; if($l){$h=($l -split '\s+')[0]}}catch{}
+          if($h){(Get-Content platforms/chocolatey/tools/chocolateyinstall.ps1)-replace "checksum64\s*=\s*'[^']+'","checksum64 = '$h'"|Set-Content platforms/chocolatey/tools/chocolateyinstall.ps1}
+          echo "VER=$v" >> $env:GITHUB_ENV
+      - run: choco pack platforms/chocolatey/oplirex.nuspec --version $env:VER; choco push "oplirex.$env:VER.nupkg" --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
         shell: pwsh
 
   aur:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Inject SHA256 into oplirex-bin PKGBUILD
+      - run: |
+          VER=${GITHUB_REF_NAME#v}; VER=${VER#v}; VER=${VER:-${{ github.event.inputs.version }}}; VER=${VER#v}
+          TMP=$(mktemp); curl -fsSL https://github.com/nxyystore/oplirex/releases/download/v$VER/SHA256SUMS.txt -o $TMP 2>/dev/null || true
+          H1=$(grep -F "oplirex-linux-x86_64.tar.gz" $TMP 2>/dev/null | awk '{print $1}'); [ -n "$H1" ] && sed -i "s/sha256sums_x86_64=('SKIP')/sha256sums_x86_64=('$H1')/" platforms/arch/PKGBUILD-bin
+          H2=$(grep -F "oplirex-linux-aarch64.tar.gz" $TMP 2>/dev/null | awk '{print $1}'); [ -n "$H2" ] && sed -i "s/sha256sums_aarch64=('SKIP')/sha256sums_aarch64=('$H2')/" platforms/arch/PKGBUILD-bin
         shell: bash
-        run: |
-          VER=${GITHUB_REF_NAME#v}; VER=${VER#v}
-          VER=${VER:-${{ github.event.inputs.version }}}; VER=${VER#v}
-          echo "VER=$VER" >> $GITHUB_ENV
-          SHA_URL="https://github.com/nxyystore/oplirex/releases/download/v$VER/SHA256SUMS.txt"
-          TMP=$(mktemp); curl -fsSL "$SHA_URL" -o "$TMP" 2>/dev/null || echo "::warning::SHA256SUMS not found for v$VER — keeping SKIP"
-          cat "$TMP" 2>/dev/null || true
-          # PKGBUILD (source build) stays SKIP (verified by building from source tarball)
-          # PKGBUILD-bin: inject per-arch tarballs for verification
-          H_X64=$(grep -F "oplirex-linux-x86_64.tar.gz" "$TMP" 2>/dev/null | awk '{print $1}')
-          H_ARM=$(grep -F "oplirex-linux-aarch64.tar.gz" "$TMP" 2>/dev/null | awk '{print $1}')
-          if [ -n "$H_X64" ]; then echo "Inject x86_64 $H_X64"; sed -i "s/sha256sums_x86_64=('SKIP')/sha256sums_x86_64=('$H_X64')/" platforms/arch/PKGBUILD-bin; sed -i "s/sha256sums_x86_64=('REPLACEME[^']*')/sha256sums_x86_64=('$H_X64')/" platforms/arch/PKGBUILD-bin; fi
-          if [ -n "$H_ARM" ]; then echo "Inject aarch64 $H_ARM"; sed -i "s/sha256sums_aarch64=('SKIP')/sha256sums_aarch64=('$H_ARM')/" platforms/arch/PKGBUILD-bin; sed -i "s/sha256sums_aarch64=('REPLACEME[^']*')/sha256sums_aarch64=('$H_ARM')/" platforms/arch/PKGBUILD-bin; fi
-          cat platforms/arch/PKGBUILD-bin | grep -E "pkgver|sha256sums"
-      - name: Publish oplirex to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+      - uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: oplirex
           pkgbuild: platforms/arch/PKGBUILD
-          commit_username: github-actions[bot]
-          commit_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_username: "github-actions[bot]"
+          commit_email: "41898282+github-actions[bot]@users.noreply.github.com"
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          ssh_keyscan_types: rsa,ecdsa,ed25519
-      - name: Publish oplirex-bin to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+      - uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: oplirex-bin
           pkgbuild: platforms/arch/PKGBUILD-bin
-          commit_username: github-actions[bot]
-          commit_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_username: "github-actions[bot]"
+          commit_email: "41898282+github-actions[bot]@users.noreply.github.com"
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          ssh_keyscan_types: rsa,ecdsa,ed25519
 
-  homebrew:
+  brew:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Inject SHA256 into Homebrew formula (all 4 archs)
-        shell: bash
-        run: |
-          VER=${GITHUB_REF_NAME#v}; VER=${VER#v}
-          VER=${VER:-${{ github.event.inputs.version }}}; VER=${VER#v}
+      - run: |
+          VER=${GITHUB_REF_NAME#v}; VER=${VER#v}; VER=${VER:-${{ github.event.inputs.version }}}; VER=${VER#v}
+          TMP=$(mktemp); curl -fsSL https://github.com/nxyystore/oplirex/releases/download/v$VER/SHA256SUMS.txt -o $TMP 2>/dev/null || true
+          for p in "oplirex-macos-arm64.tar.gz:REPLACEME_ARM64" "oplirex-macos-x86_64.tar.gz:REPLACEME_X86_64" "oplirex-linux-aarch64.tar.gz:REPLACEME_LINUX_ARM64" "oplirex-linux-x86_64.tar.gz:REPLACEME_LINUX_X86_64"; do IFS=: read f ph <<< "$p"; h=$(grep -F "$f" $TMP 2>/dev/null | awk '{print $1}'); [ -n "$h" ] && sed -i "s/sha256 \"$ph\"/sha256 \"$h\"/" platforms/homebrew/oplirex.rb; done
           echo "VER=$VER" >> $GITHUB_ENV
-          SHA_URL="https://github.com/nxyystore/oplirex/releases/download/v$VER/SHA256SUMS.txt"
-          TMP=$(mktemp); curl -fsSL "$SHA_URL" -o "$TMP" 2>/dev/null || echo "::warning::SHA256SUMS.txt not found for v$VER"
-          cat "$TMP" 2>/dev/null || true
-          inject() { local file="$1" pat="$2" placeholder="$3"; local h=$(grep -F "$pat" "$TMP" 2>/dev/null | awk '{print $1}'); if [ -n "$h" ] && [ "$h" != "REPLACEME" ]; then echo "Inject $placeholder $h for $pat"; sed -i "s/sha256 \"$placeholder\"/sha256 \"$h\"/" platforms/homebrew/oplirex.rb; sed -i "s/sha256 \"REPLACEME\"/sha256 \"$h\"/" platforms/homebrew/oplirex.rb; else echo "::warning::No SHA for $pat — leaving $placeholder"; fi; }
-          inject "$TMP" "oplirex-macos-arm64.tar.gz" "REPLACEME_ARM64"
-          inject "$TMP" "oplirex-macos-x86_64.tar.gz" "REPLACEME_X86_64"
-          inject "$TMP" "oplirex-linux-aarch64.tar.gz" "REPLACEME_LINUX_ARM64"
-          inject "$TMP" "oplirex-linux-x86_64.tar.gz" "REPLACEME_LINUX_X86_64"
-          cat platforms/homebrew/oplirex.rb | grep -E "version|sha256|url"
-      - name: Update homebrew tap
-        env:
+        shell: bash
+      - env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          VER=${VER:-${GITHUB_REF_NAME#v}}; VER=${VER#v}
-          if gh repo view nxyystore/homebrew-oplirex >/dev/null 2>&1; then
-            gh repo clone nxyystore/homebrew-oplirex /tmp/homebrew-oplirex
-            cp platforms/homebrew/oplirex.rb /tmp/homebrew-oplirex/Formula/oplirex.rb
-            cd /tmp/homebrew-oplirex && git config user.name "github-actions[bot]" && git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Formula/oplirex.rb && git diff --cached --quiet || (git commit -m "oplirex v$VER" && git push)
-          else
-            echo "homebrew-oplirex tap not found — create nxyystore/homebrew-oplirex first"
-          fi
+          gh repo view nxyystore/homebrew-oplirex >/dev/null 2>&1 || exit 0
+          gh repo clone nxyystore/homebrew-oplirex /tmp/b
+          cp platforms/homebrew/oplirex.rb /tmp/b/Formula/oplirex.rb
+          cd /tmp/b && git config user.name "github-actions[bot]" && git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/oplirex.rb && git diff --cached --quiet || git commit -m "oplirex v$VER" && git push
+        shell: bash
+
+  winget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        run: |
+          VER=${GITHUB_REF_NAME#v}; VER=${VER:-${{ github.event.inputs.version }}}; VER=${VER#v}
+          echo "version=$VER" >> $GITHUB_OUTPUT
+        shell: bash
+      - uses: vedantmgoyal2009/winget-releaser@main
+        with:
+          identifier: nxyy.oplirex
+          version: ${{ steps.ver.outputs.version }}
+          installers-regex: 'oplirex-windows.*\.(msi|exe)$'
+          token: ${{ secrets.WINGET_TOKEN }}

@@ -1,8 +1,8 @@
-name: Auto Tag on Release Commit
+name: Auto Tag
 
 on:
   push:
-    branches: [main, master]
+    branches: [master, main]
   workflow_dispatch:
 
 permissions:
@@ -10,62 +10,37 @@ permissions:
 
 jobs:
   autotag:
-    # skip only if commit explicitly has [skip ci] - guard against null head_commit (e.g. tag pushes, API)
     if: ${{ !contains(github.event.head_commit.message || '', '[skip ci]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Use PAT so tag push triggers build.yml (GITHUB_TOKEN pushes don't trigger). Falls back to GITHUB_TOKEN if GH_PAT not set.
           token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Parse commit message for release/bump version
-        id: parse
+      - id: parse
         shell: bash
         run: |
           MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
-          # Must start with release: or bump: (with optional scope) then vX.Y.Z
+          echo "msg: $MSG"
           if echo "$MSG" | grep -qiE '^(release|bump)(\(.+\))?:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+'; then
-            VER=$(echo "$MSG" | grep -oiE 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?' | head -1 | tr -d 'vV')
-            echo "ver=$VER" >> "$GITHUB_OUTPUT"
-            echo "Found version: $VER"
+            VER=$(echo "$MSG" | grep -oiE 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?' | head -1 | tr -d vV)
+            echo "ver=$VER" >> $GITHUB_OUTPUT
           else
-            echo "No release:/bump: prefix with version found — skipping"
+            echo "no version"
           fi
 
-      - name: Create tag and sync version
-        if: steps.parse.outputs.ver != ''
+      - if: steps.parse.outputs.ver != ''
         shell: bash
         run: |
           set -e
-          VER="${{ steps.parse.outputs.ver }}"
-          TAG="v$VER"
-          echo "Processing $TAG"
-
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists — skipping"
-            exit 0
-          fi
-
-          # Sync all packaging metadata from commit version
+          VER=${{ steps.parse.outputs.ver }}
+          TAG=v$VER
+          git rev-parse "$TAG" >/dev/null 2>&1 && echo "tag exists" && exit 0
           python3 scripts/sync_release_version.py "$VER"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          if ! git diff --quiet; then
-            git add -A
-            git commit -m "chore: sync version $TAG [skip ci]"
-          fi
-
+          git add -A
+          git diff --cached --quiet || git commit -m "chore: sync $TAG [skip ci]"
           git tag "$TAG"
-          # Push commit + tag (works for both main/master). Uses token from checkout.
-          # NOTE: GITHUB_TOKEN pushes do NOT trigger other workflows (build.yml). Add GH_PAT to auto-trigger.
-          BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          git push origin "HEAD:$BRANCH" --follow-tags || git push origin HEAD --follow-tags
-
-      - name: Summary
-        if: steps.parse.outputs.ver == ''
-        run: echo 'No release or bump commit - no tag created'
+          git push origin HEAD --follow-tags
