@@ -1,6 +1,6 @@
 # Maintainer: nxyy <clubbed@duck.com>
 pkgname=oplirex
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc="OpenCode Ratelimit Reset via WARP tunnel + Anthropic Proxy Bridge"
 arch=('x86_64' 'aarch64')
