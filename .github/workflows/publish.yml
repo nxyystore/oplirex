@@ -100,7 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Publish oplirex to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: oplirex
           pkgbuild: platforms/arch/PKGBUILD
@@ -109,7 +109,7 @@ jobs:
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           ssh_keyscan_types: rsa,ecdsa,ed25519
       - name: Publish oplirex-bin to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: oplirex-bin
           pkgbuild: platforms/arch/PKGBUILD-bin

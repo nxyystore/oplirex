@@ -61,4 +61,4 @@ jobs:
 
       - name: Summary
         if: steps.parse.outputs.ver == ''
-        run: echo "No release:/bump: vX.Y.Z commit — no tag created."
+        run: echo 'No release or bump commit - no tag created'
