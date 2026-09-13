@@ -9,7 +9,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![AUR](https://img.shields.io/badge/AUR-1.0.0-blue?style=flat-square)](https://aur.archlinux.org/packages/oplirex)
+[![AUR](https://img.shields.io/badge/AUR-1.0.1-blue?style=flat-square)](https://aur.archlinux.org/packages/oplirex)
 
 ## What is oplirex?
 
@@ -162,7 +162,7 @@ When connected through the proxy, these models appear in Claude Code's `/models`
 ## About
 
 ```
-Version: 1.0.0
+Version: 1.0.1
 Language: Rust
 Purpose: OpenCode rate limit reset + Anthropic proxy
 Infrastructure: Cloudflare WARP + Axum HTTP

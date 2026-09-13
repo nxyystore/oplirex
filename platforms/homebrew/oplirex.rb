@@ -1,25 +1,25 @@
 class Oplirex < Formula
   desc "OpenCode Limit Reset + Anthropic Proxy Bridge"
   homepage "https://github.com/nxyystore/oplirex"
-  version "1.0.0"
+  version "1.0.1"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/nxyystore/oplirex/releases/download/v1.0.0/oplirex-macos-arm64.tar.gz"
+      url "https://github.com/nxyystore/oplirex/releases/download/v1.0.1/oplirex-macos-arm64.tar.gz"
       sha256 "REPLACEME_ARM64"
     else
-      url "https://github.com/nxyystore/oplirex/releases/download/v1.0.0/oplirex-macos-x86_64.tar.gz"
+      url "https://github.com/nxyystore/oplirex/releases/download/v1.0.1/oplirex-macos-x86_64.tar.gz"
       sha256 "REPLACEME_X86_64"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/nxyystore/oplirex/releases/download/v1.0.0/oplirex-linux-aarch64.tar.gz"
+      url "https://github.com/nxyystore/oplirex/releases/download/v1.0.1/oplirex-linux-aarch64.tar.gz"
       sha256 "REPLACEME_LINUX_ARM64"
     else
-      url "https://github.com/nxyystore/oplirex/releases/download/v1.0.0/oplirex-linux-x86_64.tar.gz"
+      url "https://github.com/nxyystore/oplirex/releases/download/v1.0.1/oplirex-linux-x86_64.tar.gz"
       sha256 "REPLACEME_LINUX_X86_64"
     end
   end
