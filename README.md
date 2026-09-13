@@ -9,7 +9,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![AUR](https://img.shields.io/badge/AUR-2.4.1-blue?style=flat-square)](https://aur.archlinux.org/packages/oplire)
+[![AUR](https://img.shields.io/badge/AUR-1.0.0-blue?style=flat-square)](https://aur.archlinux.org/packages/oplire)
 
 ## What is oplire?
 
@@ -55,22 +55,22 @@ winget install nxyy.oplirex
 ### macOS
 
 ```bash
-brew install berkeoruc/oplire/oplire
+brew install nxyy/oplire/oplire
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/BerkeOruc/oplire.git
-cd oplire
+git clone https://github.com/nxyystore/oplirex.git
+cd oplirex
 cargo build --release
-sudo cp target/release/oplire /usr/bin/oplire
+sudo cp target/release/oplirex /usr/bin/oplirex
 ```
 
 ### Release versioning
 
 ```bash
-python3 scripts/sync_release_version.py 2.4.1
+python3 scripts/sync_release_version.py 1.0.0
 # or update the current Cargo version and sync all packaging metadata
 python3 scripts/sync_release_version.py
 ```
@@ -81,47 +81,47 @@ python3 scripts/sync_release_version.py
 
 ```bash
 # One command: starts proxy + launches Claude Code with correct env vars
-oplire connect claude-code
+oplirex connect claude-code
 
 # With specific model
-oplire connect claude-code --model glm-4.7-free
+oplirex connect claude-code --model glm-4.7-free
 
 # With custom upstream
-oplire connect claude-code --upstream http://my-opencode-server:3000
+oplirex connect claude-code --upstream http://my-opencode-server:3000
 ```
 
 ### WARP Reset Commands
 
 ```bash
-oplire reset          # Full WARP tunnel reset
-oplire quick-reset    # Fast IP rotation (no service restart)
-oplire status         # Check WARP connection status
-oplire stop           # Stop WARP tunnel
-oplire install        # Install Cloudflare WARP
+oplirex reset          # Full WARP tunnel reset
+oplirex quick-reset    # Fast IP rotation (no service restart)
+oplirex status         # Check WARP connection status
+oplirex stop           # Stop WARP tunnel
+oplirex install        # Install Cloudflare WARP
 ```
 
 ### Proxy Commands
 
 ```bash
-oplire proxy                          # Start reverse proxy on :8080
-oplire proxy --listen 0.0.0.0:9000    # Custom listen address
-oplire daemon                         # Background daemon mode
-oplire watch                          # Monitor OpenCode, auto-reset on 429
+oplirex proxy                          # Start reverse proxy on :8080
+oplirex proxy --listen 0.0.0.0:9000    # Custom listen address
+oplirex daemon                         # Background daemon mode
+oplirex watch                          # Monitor OpenCode, auto-reset on 429
 ```
 
 ### Configuration
 
 ```bash
-oplire config show    # Show current settings
-oplire config set     # Save configuration
-oplire config reset   # Reset to defaults
+oplirex config show    # Show current settings
+oplirex config set     # Save configuration
+oplirex config reset   # Reset to defaults
 ```
 
 ### Diagnostics
 
 ```bash
-oplire doctor         # Check WARP, Claude Code, OpenCode setup
-oplire about          # Show version and info
+oplirex doctor         # Check WARP, Claude Code, OpenCode setup
+oplirex about          # Show version and info
 ```
 
 ## Claude Code Integration
@@ -129,14 +129,14 @@ oplire about          # Show version and info
 ### Method 1: One-liner (Recommended)
 
 ```bash
-oplire connect claude-code
+oplirex connect claude-code
 ```
 
 ### Method 2: Manual Environment
 
 ```bash
 # Start proxy in background
-oplire daemon &
+oplirex daemon &
 
 # Set environment and launch Claude Code
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
@@ -174,11 +174,11 @@ When connected through the proxy, these models appear in Claude Code's `/models`
 ## About
 
 ```
-Version: 2.4.1
+Version: 1.0.0
 Language: Rust
 Purpose: OpenCode rate limit reset + Anthropic proxy
 Infrastructure: Cloudflare WARP + Axum HTTP
-Author: Berke Oruc
+Author: nxyy
 GitHub: https://github.com/nxyystore/oplire
 ```
 

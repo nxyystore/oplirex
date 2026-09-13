@@ -1,11 +1,11 @@
 # Maintainer: nxyy <clubbed@duck.com>
 # Prebuilt binary package — fast install (default recommended)
 pkgname=oplirex-bin
-pkgver=2.4.1
+pkgver=1.0.0
 pkgrel=1
 pkgdesc="OpenCode Ratelimit Reset via WARP tunnel + Anthropic Proxy Bridge (prebuilt binary)"
 arch=('x86_64' 'aarch64')
-url="https://github.com/nxyystore/oplirex"
+url="https://github.com/nxyystore/oplire"
 license=('MIT')
 depends=('glibc' 'gcc-libs')
 optdepends=('cloudflare-warp-bin: for WARP tunnel rate limit reset')

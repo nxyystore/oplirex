@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="oplirex" Manufacturer="nxyy" Version="2.4.1" UpgradeCode="a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6">
+  <Package Name="oplirex" Manufacturer="nxyy" Version="1.0.0" UpgradeCode="a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6">
     <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
     <Media Id="1" Cabinet="oplirex.cab" EmbedCab="yes" />
     <StandardDirectory Id="ProgramFilesFolder">
