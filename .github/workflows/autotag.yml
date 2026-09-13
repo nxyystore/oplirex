@@ -36,11 +36,19 @@ jobs:
           set -e
           VER=${{ steps.parse.outputs.ver }}
           TAG=v$VER
-          git rev-parse "$TAG" >/dev/null 2>&1 && echo "tag exists" && exit 0
+          # skip only if tag already exists on remote
+          if git ls-remote --tags origin | grep -q "refs/tags/$TAG$"; then
+            echo "tag $TAG already on remote — skip"
+            exit 0
+          fi
+          git fetch --tags --force origin || true
+          # if local tag exists stale, delete it so we recreate annotated
+          git tag -d "$TAG" 2>/dev/null || true
           python3 scripts/sync_release_version.py "$VER"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --cached --quiet || git commit -m "chore: sync $TAG [skip ci]"
-          git tag "$TAG"
-          git push origin HEAD --follow-tags
+          git tag -a "$TAG" -m "$TAG"
+          git push origin HEAD
+          git push origin "$TAG"
