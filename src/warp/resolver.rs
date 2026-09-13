@@ -4,12 +4,15 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+use crate::hooks::{run_hook, HookEnv};
+
 static ACTIVE_429_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESET_IN_PROGRESS: Mutex<()> = Mutex::const_new(());
 
 pub struct WarpResolver {
     pub max_retries: u32,
     pub reset_delay_ms: u64,
+    pub hook_on_429: Option<String>,
 }
 
 impl WarpResolver {
@@ -17,7 +20,17 @@ impl WarpResolver {
         Self {
             max_retries,
             reset_delay_ms,
+            hook_on_429: None,
         }
+    }
+
+    pub fn with_hook(mut self, hook: Option<String>) -> Self {
+        self.hook_on_429 = hook;
+        self
+    }
+
+    pub fn set_hook(&mut self, hook: Option<String>) {
+        self.hook_on_429 = hook;
     }
 
     pub async fn handle_429(&self, retry_count: u32) -> bool {
@@ -43,6 +56,16 @@ impl WarpResolver {
             "HTTP 429 detected (count: {}). Initiating WARP reset...",
             count
         );
+
+        // Fire hook non-blocking before reset (provides RETRY_COUNT, WARP_IP etc)
+        if let Some(hook) = &self.hook_on_429 {
+            let mut env = HookEnv::new(retry_count);
+            // Try to capture current WARP IP best-effort
+            if let Ok(ip) = fetch_warp_ip().await {
+                env.warp_ip = Some(ip);
+            }
+            run_hook(hook, env);
+        }
 
         if let Err(e) = self.reset_warp().await {
             error!("WARP reset failed: {}", e);
@@ -333,4 +356,27 @@ async fn run_privileged_command(cmd: &str) -> Result<(), String> {
             Err(format!("sh -c {cmd} failed: {}", stderr.trim()))
         }
     }
+}
+
+async fn fetch_warp_ip() -> Result<String, String> {
+    let out = Command::new("warp-cli")
+        .arg("status")
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    let txt = String::from_utf8_lossy(&out.stdout).to_string();
+    // Try to parse IP from status output; fallback to empty
+    for line in txt.lines() {
+        let l = line.trim();
+        if l.contains("IP") || l.contains("ip") {
+            // heuristic: extract first token looking like ipv4
+            for tok in l.split_whitespace() {
+                if tok.chars().filter(|c| *c == '.').count() == 3 {
+                    return Ok(tok.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').to_string());
+                }
+            }
+        }
+    }
+    // fallback: try curl ifconfig
+    Ok(txt.lines().next().unwrap_or("").to_string())
 }

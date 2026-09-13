@@ -14,7 +14,9 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::config::ProxyConfig;
-use crate::transform::{anthropic_to_opencode_request, opencode_stream_to_anthropic, opencode_response_to_anthropic};
+use crate::hooks::{run_hook, HookEnv};
+use crate::metrics::METRICS;
+use crate::providers::{translate_request, translate_response, translate_stream_chunk};
 use crate::warp::WarpResolver;
 
 pub struct ProxyState {
@@ -24,14 +26,20 @@ pub struct ProxyState {
 }
 
 pub async fn handle_models(State(state): State<Arc<Mutex<ProxyState>>>) -> impl IntoResponse {
-    let state_guard = state.lock().await;
-    let base_url = state_guard.config.opencode_base_url.clone();
-    let api_key = state_guard.config.opencode_api_key.clone();
-    drop(state_guard);
+    METRICS.inc_request();
+    let start = std::time::Instant::now();
+    let (client, base_url, api_key) = {
+        let state_guard = state.lock().await;
+        (
+            state_guard.client.clone(),
+            state_guard.config.opencode_base_url.clone(),
+            state_guard.config.opencode_api_key.clone(),
+        )
+    };
 
     let models_url = format!("{}/v1/models", base_url.trim_end_matches('/'));
 
-    let mut request = reqwest::Client::new()
+    let mut request = client
         .get(&models_url)
         .header("Accept", "application/json");
 
@@ -39,7 +47,7 @@ pub async fn handle_models(State(state): State<Arc<Mutex<ProxyState>>>) -> impl 
         request = request.header("Authorization", format!("Bearer {}", key));
     }
 
-    match request.send().await {
+    let result = match request.send().await {
         Ok(resp) if resp.status().is_success() => {
             match resp.json::<Value>().await {
                 Ok(upstream_models) => {
@@ -60,7 +68,9 @@ pub async fn handle_models(State(state): State<Arc<Mutex<ProxyState>>>) -> impl 
             warn!("Failed to fetch models from upstream: {}", e);
             (StatusCode::OK, Json(ProxyConfig::models_response()))
         }
-    }
+    };
+    METRICS.record_latency(start.elapsed().as_millis() as u64);
+    result
 }
 
 fn transform_models_to_anthropic(upstream: &Value) -> Value {
@@ -160,14 +170,20 @@ pub async fn handle_model_detail(
     State(state): State<Arc<Mutex<ProxyState>>>,
     axum::extract::Path(model_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let state_guard = state.lock().await;
-    let base_url = state_guard.config.opencode_base_url.clone();
-    let api_key = state_guard.config.opencode_api_key.clone();
-    drop(state_guard);
+    METRICS.inc_request();
+    let start = std::time::Instant::now();
+    let (client, base_url, api_key) = {
+        let state_guard = state.lock().await;
+        (
+            state_guard.client.clone(),
+            state_guard.config.opencode_base_url.clone(),
+            state_guard.config.opencode_api_key.clone(),
+        )
+    };
 
     let model_url = format!("{}/v1/models/{}", base_url.trim_end_matches('/'), model_id);
 
-    let mut request = reqwest::Client::new()
+    let mut request = client
         .get(&model_url)
         .header("Accept", "application/json");
 
@@ -175,7 +191,7 @@ pub async fn handle_model_detail(
         request = request.header("Authorization", format!("Bearer {}", key));
     }
 
-    match request.send().await {
+    let resp = match request.send().await {
         Ok(resp) if resp.status().is_success() => {
             match resp.json::<Value>().await {
                 Ok(model) => {
@@ -198,7 +214,9 @@ pub async fn handle_model_detail(
             }
         }
         _ => StatusCode::NOT_FOUND.into_response(),
-    }
+    };
+    METRICS.record_latency(start.elapsed().as_millis() as u64);
+    resp
 }
 
 pub async fn handle_messages(
@@ -206,10 +224,13 @@ pub async fn handle_messages(
     _headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    METRICS.inc_request();
+    let start = std::time::Instant::now();
     let request_body = match serde_json::from_slice::<Value>(&body) {
         Ok(v) => v,
         Err(e) => {
             error!("Failed to parse request body: {}", e);
+            METRICS.record_latency(start.elapsed().as_millis() as u64);
             return error_response(&format!("Invalid JSON: {}", e));
         }
     };
@@ -225,29 +246,48 @@ pub async fn handle_messages(
         .unwrap_or("unknown")
         .to_string();
 
-    let opencode_body = anthropic_to_opencode_request(&request_body);
+    let (client, base_url, api_key, max_retries, reset_delay, hook_on_429, provider) = {
+        let state_guard = state.lock().await;
+        (
+            state_guard.client.clone(),
+            state_guard.config.opencode_base_url.clone(),
+            state_guard.config.opencode_api_key.clone(),
+            state_guard.config.max_retries,
+            state_guard.config.warp_reset_delay_ms,
+            state_guard.config.hook_on_429.clone(),
+            state_guard.config.provider,
+        )
+    };
 
-    let state_guard = state.lock().await;
-    let base_url = state_guard.config.opencode_base_url.clone();
-    let api_key = state_guard.config.opencode_api_key.clone();
-    let max_retries = state_guard.config.max_retries;
-    let reset_delay = state_guard.config.warp_reset_delay_ms;
-    drop(state_guard);
+    let translated_body = translate_request(provider, &request_body);
 
     let mut retry_count = 0;
+    let mut backoff_retries: u32 = 0;
 
     loop {
         let result = if is_stream {
-            forward_streaming(&base_url, &api_key, &opencode_body, &model).await
+            forward_streaming(&client, &base_url, &api_key, &translated_body, &model, provider).await
         } else {
-            forward_non_streaming(&base_url, &api_key, &opencode_body, &model).await
+            forward_non_streaming(&client, &base_url, &api_key, &translated_body, &model, provider).await
         };
 
         match result {
-            Ok(response) => return response,
+            Ok(response) => {
+                METRICS.record_latency(start.elapsed().as_millis() as u64);
+                return response;
+            },
             Err(ProxyError::RateLimited) => {
+                METRICS.inc_429();
                 retry_count += 1;
+                // hook integration P2.9: fire on_429 hook non-blocking
+                if let Some(hook) = &hook_on_429 {
+                    let mut env = HookEnv::new(retry_count);
+                    env.model = Some(model.clone());
+                    env.upstream = Some(base_url.clone());
+                    run_hook(hook, env);
+                }
                 if retry_count > max_retries {
+                    METRICS.record_latency(start.elapsed().as_millis() as u64);
                     return error_response("Rate limit exceeded after WARP resets");
                 }
 
@@ -256,13 +296,32 @@ pub async fn handle_messages(
                     retry_count, max_retries
                 );
 
-                let resolver = WarpResolver::new(max_retries, reset_delay);
+                let resolver = WarpResolver::new(max_retries, reset_delay).with_hook(hook_on_429.clone());
                 if !resolver.handle_429(retry_count - 1).await {
+                    METRICS.record_latency(start.elapsed().as_millis() as u64);
                     return error_response("WARP reset failed, rate limit still active");
                 }
+                // WARP reset succeeded; track it and retry
+                METRICS.inc_warp_reset();
+            }
+            Err(ProxyError::Retryable(status)) => {
+                METRICS.inc_retry();
+                backoff_retries += 1;
+                if backoff_retries > max_retries {
+                    METRICS.record_latency(start.elapsed().as_millis() as u64);
+                    return error_response(&format!("Upstream {} unavailable after {} retries", status, max_retries));
+                }
+                let backoff_ms = 200_u64.saturating_mul(2_u64.pow(backoff_retries - 1)).min(5000);
+                warn!(
+                    "Upstream {} retryable, backing off {}ms (attempt {}/{})",
+                    status, backoff_ms, backoff_retries, max_retries
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                continue;
             }
             Err(ProxyError::RequestFailed(msg)) => {
                 error!("Upstream request failed: {}", msg);
+                METRICS.record_latency(start.elapsed().as_millis() as u64);
                 return error_response(&format!("Upstream error: {}", msg));
             }
         }
@@ -270,14 +329,17 @@ pub async fn handle_messages(
 }
 
 async fn forward_streaming(
+    client: &Client,
     base_url: &str,
     api_key: &Option<String>,
     body: &Value,
     model: &str,
+    provider: crate::providers::Provider,
 ) -> Result<Response, ProxyError> {
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let path = provider.upstream_path();
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
 
-    let mut request = reqwest::Client::new()
+    let mut request = client
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
@@ -296,6 +358,10 @@ async fn forward_streaming(
         return Err(ProxyError::RateLimited);
     }
 
+    if response.status() == StatusCode::BAD_GATEWAY || response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        return Err(ProxyError::Retryable(response.status()));
+    }
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response
@@ -309,21 +375,38 @@ async fn forward_streaming(
     }
 
     let model_owned = model.to_string();
+    // Buffer incomplete SSE lines across chunks
+    let mut buffer = String::new();
     let stream = response
         .bytes_stream()
         .map(move |chunk| {
             let chunk = chunk.map_err(std::io::Error::other)?;
-            let lines = String::from_utf8_lossy(&chunk);
-            let mut output = String::new();
+            let text = String::from_utf8_lossy(&chunk);
+            buffer.push_str(&text);
 
-            for line in lines.lines() {
-                if let Some(transformed) = opencode_stream_to_anthropic(line, &model_owned) {
+            let mut output = String::new();
+            // Drain complete lines (ending with '\n') from buffer
+            while let Some(newline_idx) = buffer.find('\n') {
+                let line = buffer[..newline_idx].to_string();
+                // Remove consumed line + newline from buffer
+                buffer.drain(..=newline_idx);
+                let trimmed = line.trim_end_matches('\r');
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(transformed) = translate_stream_chunk(provider, trimmed, &model_owned) {
                     output.push_str(&transformed);
+                } else {
+                    if trimmed.starts_with("data:") || trimmed.starts_with("event:") || trimmed.starts_with(":") {
+                        // fallback passthrough for provider native streams
+                        output.push_str(trimmed);
+                        output.push('\n');
+                    }
                 }
             }
 
             if output.is_empty() {
-                Ok::<Bytes, std::io::Error>(Bytes::from(lines.into_owned()))
+                Ok::<Bytes, std::io::Error>(Bytes::new())
             } else {
                 Ok::<Bytes, std::io::Error>(Bytes::from(output))
             }
@@ -352,14 +435,17 @@ async fn forward_streaming(
 }
 
 async fn forward_non_streaming(
+    client: &Client,
     base_url: &str,
     api_key: &Option<String>,
     body: &Value,
     model: &str,
+    provider: crate::providers::Provider,
 ) -> Result<Response, ProxyError> {
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let path = provider.upstream_path();
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
 
-    let mut request = reqwest::Client::new()
+    let mut request = client
         .post(&url)
         .header("Content-Type", "application/json")
         .json(body);
@@ -375,6 +461,10 @@ async fn forward_non_streaming(
 
     if response.status() == 429 {
         return Err(ProxyError::RateLimited);
+    }
+
+    if response.status() == StatusCode::BAD_GATEWAY || response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        return Err(ProxyError::Retryable(response.status()));
     }
 
     if !response.status().is_success() {
@@ -394,7 +484,7 @@ async fn forward_non_streaming(
         .await
         .map_err(|e| ProxyError::RequestFailed(e.to_string()))?;
 
-    let anthropic_response = opencode_response_to_anthropic(&opencode_response, model);
+    let anthropic_response = translate_response(provider, &opencode_response, model);
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -427,5 +517,6 @@ fn error_response(message: &str) -> Response {
 #[derive(Debug)]
 enum ProxyError {
     RateLimited,
+    Retryable(StatusCode),
     RequestFailed(String),
 }

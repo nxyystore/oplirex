@@ -16,7 +16,7 @@ jobs:
         with:
           fetch-depth: 0
           # Use PAT so push triggers build.yml; fallback to GITHUB_TOKEN if no PAT configured
-          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GH_PAT }}
 
       - name: Parse commit message for release/bump version
         id: parse

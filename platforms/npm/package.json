@@ -1,6 +1,6 @@
 {
   "name": "oplirex",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "description": "OpenCode Limit Reset + Anthropic Proxy Bridge",
   "bin": {
     "oplirex": "bin/oplirex.js",

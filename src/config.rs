@@ -1,3 +1,5 @@
+use crate::providers::Provider;
+
 /// Proxy configuration for the Anthropic ↔ OpenCode Zen bridge.
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -11,6 +13,10 @@ pub struct ProxyConfig {
     pub max_retries: u32,
     /// Delay between WARP reset steps (milliseconds)
     pub warp_reset_delay_ms: u64,
+    /// Optional shell hook to run on 429 (P2.9)
+    pub hook_on_429: Option<String>,
+    /// Upstream provider selection (P2.7)
+    pub provider: Provider,
 }
 
 /// A free model available on OpenCode Zen.
@@ -30,6 +36,8 @@ impl Default for ProxyConfig {
             opencode_api_key: None,
             max_retries: 3,
             warp_reset_delay_ms: 5000,
+            hook_on_429: None,
+            provider: Provider::default(),
         }
     }
 }
@@ -82,12 +90,20 @@ impl ProxyConfig {
     }
 }
 
+fn default_provider() -> crate::providers::Provider {
+    crate::providers::Provider::default()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppConfig {
     pub listen: String,
     pub upstream: String,
     pub max_retries: u32,
     pub warp_delay: u64,
+    #[serde(default = "default_provider")]
+    pub provider: crate::providers::Provider,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -97,6 +113,22 @@ impl Default for AppConfig {
             upstream: "http://localhost:3000".to_string(),
             max_retries: 3,
             warp_delay: 5000,
+            provider: crate::providers::Provider::default(),
+            api_key: None,
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn into_proxy_config(self) -> ProxyConfig {
+        ProxyConfig {
+            listen_addr: self.listen,
+            opencode_base_url: self.upstream,
+            opencode_api_key: self.api_key,
+            max_retries: self.max_retries,
+            warp_reset_delay_ms: self.warp_delay,
+            hook_on_429: None,
+            provider: self.provider,
         }
     }
 }

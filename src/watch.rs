@@ -2,6 +2,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use tracing::{info, warn, error};
 
+use crate::hooks::{run_hook, HookEnv};
 use crate::warp::WarpResolver;
 
 pub async fn start_watch_mode(
@@ -9,11 +10,20 @@ pub async fn start_watch_mode(
     max_retries: u32,
     warp_delay_ms: u64,
 ) -> anyhow::Result<()> {
+    start_watch_mode_with_hook(upstream, max_retries, warp_delay_ms, None).await
+}
+
+pub async fn start_watch_mode_with_hook(
+    upstream: &str,
+    max_retries: u32,
+    warp_delay_ms: u64,
+    hook_on_429: Option<String>,
+) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let resolver = WarpResolver::new(max_retries, warp_delay_ms);
+    let resolver = WarpResolver::new(max_retries, warp_delay_ms).with_hook(hook_on_429.clone());
     let models_url = format!("{}/v1/models", upstream.trim_end_matches('/'));
 
     let mut check_interval = interval(Duration::from_secs(30));
@@ -36,6 +46,12 @@ pub async fn start_watch_mode(
                     info!("OpenCode Zen: OK (status {})", status);
                 } else if status.as_u16() == 429 {
                     consecutive_429 += 1;
+                    // P2.9 hook: fire on_429 non-blocking
+                    if let Some(hook) = &hook_on_429 {
+                        let mut env = HookEnv::new(consecutive_429);
+                        env.upstream = Some(upstream.to_string());
+                        run_hook(hook, env);
+                    }
                     warn!(
                         "Rate limit detected (count: {}). Triggering WARP reset...",
                         consecutive_429

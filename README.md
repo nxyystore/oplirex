@@ -40,22 +40,10 @@ Claude Code → oplire proxy (127.0.0.1:8080) → OpenCode Zen
 
 ## Installation
 
-### Linux (AUR)
-
 ```bash
-yay -S oplirex
-```
+npm i -g oplirex@latest
+brew install nxyystore/oplirex/oplirex
 
-### Windows (winget)
-
-```powershell
-winget install nxyy.oplirex
-```
-
-### macOS
-
-```bash
-brew install nxyy/oplire/oplire
 ```
 
 ### From Source

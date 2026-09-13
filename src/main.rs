@@ -4,6 +4,9 @@ use oplirex::{ProxyConfig, AppConfig};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -47,6 +50,8 @@ enum Commands {
         max_retries: u32,
         #[arg(long, default_value = "5000")]
         warp_delay: u64,
+        #[arg(long, value_name = "CMD")]
+        on_429: Option<String>,
     },
     Connect {
         #[command(subcommand)]
@@ -59,28 +64,39 @@ enum Commands {
         max_retries: u32,
         #[arg(long, default_value = "5000")]
         warp_delay: u64,
+        #[arg(long, value_name = "CMD")]
+        on_429: Option<String>,
     },
     Daemon {
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        listen: String,
-        #[arg(long, default_value = "http://localhost:3000")]
-        upstream: String,
-        #[arg(long)]
-        api_key: Option<String>,
-        #[arg(long, default_value = "3")]
-        max_retries: u32,
-        #[arg(long, default_value = "5000")]
-        warp_delay: u64,
+        #[command(subcommand)]
+        action: DaemonAction,
     },
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    Doctor {},
+    Doctor {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        verbose: bool,
+        #[arg(long, default_value = "http://localhost:3000")]
+        upstream: String,
+    },
     Setup {},
     Models {
         #[arg(long, default_value = "http://localhost:3000")]
         upstream: String,
+    },
+    Update {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    Hook {
+        #[arg(long, value_name = "CMD")]
+        on_429: Option<String>,
     },
 }
 
@@ -136,6 +152,26 @@ enum ConfigAction {
     Reset {},
 }
 
+#[derive(Subcommand, Debug)]
+enum DaemonAction {
+    Start {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        #[arg(long, default_value = "http://localhost:3000")]
+        upstream: String,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "3")]
+        max_retries: u32,
+        #[arg(long, default_value = "5000")]
+        warp_delay: u64,
+    },
+    Stop {},
+    Install {},
+    Uninstall {},
+    Status {},
+}
+
 fn config_path() -> PathBuf {
     let mut path = dirs_config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("oplire");
@@ -161,6 +197,124 @@ fn dirs_config_dir() -> Option<PathBuf> {
         return Some(p);
     }
     None
+}
+
+/// Resolve log directory: prefers platform data_local_dir, falls back to ~/.oplire/logs
+pub fn resolve_log_dir() -> PathBuf {
+    // Try platform-specific data_local_dir
+    if let Some(dir) = dirs_data_local_dir() {
+        let mut p = dir;
+        p.push("oplire");
+        p.push("logs");
+        return p;
+    }
+    // Fallback to ~/.oplire/logs
+    if let Ok(home) = std::env::var("HOME") {
+        let mut p = PathBuf::from(home);
+        p.push(".oplire");
+        p.push("logs");
+        return p;
+    }
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        let mut p = PathBuf::from(userprofile);
+        p.push(".oplire");
+        p.push("logs");
+        return p;
+    }
+    PathBuf::from("./logs")
+}
+
+fn dirs_data_local_dir() -> Option<PathBuf> {
+    // Windows: %LOCALAPPDATA%
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        if !local.is_empty() {
+            return Some(PathBuf::from(local));
+        }
+    }
+    // macOS: ~/Library/Application Support is also used for data, but XDG_DATA_HOME style
+    if cfg!(target_os = "macos") {
+        if let Ok(home) = std::env::var("HOME") {
+            let mut p = PathBuf::from(home);
+            p.push("Library");
+            p.push("Application Support");
+            return Some(p);
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let mut p = PathBuf::from(home);
+        p.push(".local");
+        p.push("share");
+        return Some(p);
+    }
+    None
+}
+
+static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+
+/// Initialize tracing with console + daily-rotated file appender.
+/// Keeps console logging, adds file appender at `resolve_log_dir()/oplirex.log` with daily rotation.
+/// Structured JSON is used for file output (A/B logging: human console + JSON file).
+pub fn init_tracing(verbose: bool) {
+    // Prevent double init
+    if tracing::dispatcher::has_been_set() {
+        return;
+    }
+
+    let env_filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| EnvFilter::try_new(v).ok())
+        .unwrap_or_else(|| {
+            if verbose {
+                EnvFilter::new("debug")
+            } else {
+                EnvFilter::new("info")
+            }
+        });
+
+    let log_dir = resolve_log_dir();
+    // Best-effort create log dir
+    let _ = fs::create_dir_all(&log_dir);
+
+    // Try to create daily rolling file appender
+    let file_appender_result = std::panic::catch_unwind(|| {
+        tracing_appender::rolling::daily(&log_dir, "oplirex.log")
+    });
+
+    if let Ok(file_appender) = file_appender_result {
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        // Keep guard alive for program lifetime
+        let _ = LOG_GUARD.set(guard);
+
+        let console_layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(true)
+            .with_target(false);
+
+        let file_layer = fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_target(true)
+            .json();
+
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer)
+            .with(file_layer);
+
+        let _ = subscriber.try_init();
+        tracing::info!("tracing initialized: console + file {}", log_dir.join("oplirex.log").display());
+    } else {
+        // Fallback: console only
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt::layer().with_writer(std::io::stderr).with_ansi(true));
+        let _ = subscriber.try_init();
+    }
 }
 
 fn load_config() -> AppConfig {
@@ -407,6 +561,7 @@ fn print_info_formatted(label: &str, desc: &str) {
 
 fn main() {
     let cli = Cli::parse();
+    init_tracing(cli.verbose);
 
     if cli.verbose {
         eprintln!("{} Verbose mode enabled", "[DEBUG]".yellow());
@@ -506,71 +661,163 @@ fn main() {
         }
 
         Commands::Setup {} => {
+            use std::io::{self, Write};
+            use std::str::FromStr;
+            fn prompt_with_default(prompt: &str, default: &str) -> String {
+                print!("{} {} [{}]: ", "→".cyan(), prompt.bold(), default.dimmed());
+                io::stdout().flush().ok();
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).ok();
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() { default.to_string() } else { trimmed }
+            }
+            fn validate_listen(s: &str) -> Result<(), String> {
+                if s.parse::<std::net::SocketAddr>().is_ok() { return Ok(()); }
+                // allow host:port without strict IP check
+                let parts: Vec<&str> = s.split(':').collect();
+                if parts.len() == 2 && !parts[0].is_empty() && parts[1].parse::<u16>().is_ok() {
+                    // basic host validation
+                    if parts[0].chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_' ) {
+                        return Ok(());
+                    }
+                }
+                Err("must be host:port like 127.0.0.1:8080".to_string())
+            }
+            fn validate_upstream(s: &str) -> Result<(), String> {
+                if s.starts_with("http://") || s.starts_with("https://") {
+                    if s.len() > 10 && !s.contains(' ') { return Ok(()); }
+                }
+                Err("must start with http:// or https://".to_string())
+            }
+            fn validate_retries(s: &str) -> Result<u32, String> {
+                let v: u32 = s.parse().map_err(|_| "must be integer 0-20".to_string())?;
+                if v > 20 { return Err("max 20".to_string()); }
+                Ok(v)
+            }
+            fn validate_delay(s: &str) -> Result<u64, String> {
+                let v: u64 = s.parse().map_err(|_| "must be integer milliseconds".to_string())?;
+                if v > 60000 { return Err("max 60000 ms".to_string()); }
+                Ok(v)
+            }
+
             print_banner();
             println!("{}", "Welcome to oplire Setup Wizard".bold().green());
             println!();
-            println!("{}", "This will check and install all required components.".dimmed());
+            println!("{}", "Interactive config — press Enter to keep defaults.".dimmed());
             println!();
 
-            let mut steps_needed = Vec::new();
+            // Load existing config (or defaults)
+            let mut cfg = load_config();
+            println!("{} Current config file: {}", "→".cyan(), config_path().display().to_string().dimmed());
+            println!();
 
-            if !check_node_installed() {
-                steps_needed.push(("Node.js", "npm install -g npm", "Required for Claude Code and OpenCode"));
+            // 1. listen address
+            loop {
+                let input = prompt_with_default("Listen address", &cfg.listen);
+                match validate_listen(&input) {
+                    Ok(()) => { cfg.listen = input; break; },
+                    Err(e) => print_fail(&format!("Invalid listen: {}", e)),
+                }
             }
-            if !warp_installed {
-                steps_needed.push(("Cloudflare WARP", "oplire install warp", "Required for rate limit reset"));
+            // 2. upstream
+            loop {
+                let input = prompt_with_default("Upstream URL", &cfg.upstream);
+                match validate_upstream(&input) {
+                    Ok(()) => { cfg.upstream = input; break; },
+                    Err(e) => print_fail(&format!("Invalid upstream: {}", e)),
+                }
             }
-            if !check_opencode_installed() {
-                steps_needed.push(("OpenCode", "oplire install opencode", "AI coding assistant backend"));
+            // 3. api_key
+            {
+                let current = cfg.api_key.clone().unwrap_or_default();
+                let display = if current.is_empty() { "(none)".to_string() } else { current.clone() };
+                let input = prompt_with_default("API key (leave empty for none)", &display);
+                if input == "(none)" || input.is_empty() {
+                    cfg.api_key = None;
+                } else if input != display {
+                    cfg.api_key = Some(input);
+                }
+                // if user kept "(none)" and had value, they cleared it already
+                if current.is_empty() && display == "(none)" {
+                    // if they pressed enter, keep None
+                    if cfg.api_key.is_some() && cfg.api_key.as_deref() == Some("(none)") {
+                        cfg.api_key = None;
+                    }
+                }
             }
-            if !check_claude_installed() {
-                steps_needed.push(("Claude Code", "oplire install claudecode", "AI coding assistant CLI"));
+            // 4. max_retries
+            loop {
+                let def = cfg.max_retries.to_string();
+                let input = prompt_with_default("Max retries (0-20)", &def);
+                match validate_retries(&input) {
+                    Ok(v) => { cfg.max_retries = v; break; },
+                    Err(e) => print_fail(&e),
+                }
             }
-
-            if steps_needed.is_empty() {
-                println!("{}", "Everything is already installed!".green().bold());
+            // 5. warp_delay
+            loop {
+                let def = cfg.warp_delay.to_string();
+                let input = prompt_with_default("WARP delay ms (0-60000)", &def);
+                match validate_delay(&input) {
+                    Ok(v) => { cfg.warp_delay = v; break; },
+                    Err(e) => print_fail(&e),
+                }
+            }
+            // 6. provider selection
+            loop {
                 println!();
-                println!("{} Run to get started:", "Tip:".cyan().bold());
-                println!("  {}", "oplire connect claude-code".bold().yellow());
-                return;
-            }
-
-            println!("{}", "The following components need to be installed:".bold());
-            println!();
-            for (name, _, desc) in &steps_needed {
-                print_info_formatted(name, desc);
-            }
-            println!();
-
-            for (i, (name, _cmd, _)) in steps_needed.iter().enumerate() {
-                println!();
-                print_step(i + 1, &format!("Installing {}...", name));
-
-                match *name {
-                    "Node.js" => {
-                        println!("  {} Node.js must be installed manually", "ℹ".yellow());
-                        println!("  {}", "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash".dimmed());
-                        println!("  {}", "Then restart your terminal".dimmed());
-                    }
-                    "Cloudflare WARP" => {
-                        let _ = run_interactive("oplire", &["install", "warp"]);
-                    }
-                    "OpenCode" => {
-                        let _ = run_interactive("oplire", &["install", "opencode"]);
-                    }
-                    "Claude Code" => {
-                        let _ = run_interactive("oplire", &["install", "claude-code"]);
-                    }
-                    _ => {}
+                println!("{}", "Provider selection:".bold());
+                println!("  {} opencode (default, OpenAI-compatible via Zen)", "[1]".dimmed());
+                println!("  {} openai   (direct OpenAI)", "[2]".dimmed());
+                println!("  {} anthropic (direct Anthropic)", "[3]".dimmed());
+                let cur = cfg.provider.to_string();
+                let input = prompt_with_default("Provider [1/opencode, 2/openai, 3/anthropic]", &cur);
+                let parsed = match input.trim().to_lowercase().as_str() {
+                    "1" | "opencode" => Ok(oplirex::providers::Provider::Opencode),
+                    "2" | "openai" => Ok(oplirex::providers::Provider::OpenAI),
+                    "3" | "anthropic" => Ok(oplirex::providers::Provider::Anthropic),
+                    other => oplirex::providers::Provider::from_str(other),
+                };
+                match parsed {
+                    Ok(p) => { cfg.provider = p; break; },
+                    Err(e) => print_fail(&e),
                 }
             }
 
             println!();
-            println!("{}", "Setup complete!".green().bold());
-                println!();
-                println!("{}", "Next steps:".bold());
-                println!("  1. {}", "oplire doctor".bold().yellow());
-                println!("  2. {}", "oplire connect claude-code".bold().yellow());
+            match save_config(&cfg) {
+                Ok(()) => {
+                    print_success(&format!("Configuration saved to {}", config_path().display()));
+                    println!("  {} {}", "listen:".bold(), cfg.listen);
+                    println!("  {} {}", "upstream:".bold(), cfg.upstream);
+                    println!("  {} {}", "provider:".bold(), cfg.provider.to_string());
+                    println!("  {} {}", "api_key:".bold(), if cfg.api_key.is_some() { "***" } else { "(none)" });
+                    println!("  {} {}", "max_retries:".bold(), cfg.max_retries);
+                    println!("  {} {}ms", "warp_delay:".bold(), cfg.warp_delay);
+                }
+                Err(e) => {
+                    print_fail(&format!("Failed to save config: {}", e));
+                    std::process::exit(1);
+                }
+            }
+
+            println!();
+            // Optionally offer to install missing components
+            let mut steps_needed = Vec::new();
+            if !check_node_installed() { steps_needed.push("Node.js"); }
+            if !warp_installed { steps_needed.push("Cloudflare WARP"); }
+            if !check_opencode_installed() { steps_needed.push("OpenCode"); }
+            if !check_claude_installed() { steps_needed.push("Claude Code"); }
+            if steps_needed.is_empty() {
+                println!("{}", "All components already installed!".green().bold());
+            } else {
+                println!("{} Missing: {}", "Note:".yellow().bold(), steps_needed.join(", ").dimmed());
+                println!("{} Run `oplire install all` or install individually.", "Tip:".cyan());
+            }
+            println!();
+            println!("{}", "Next steps:".bold());
+            println!("  1. {}", "oplire doctor".bold().yellow());
+            println!("  2. {}", "oplire proxy  (or connect claude-code)".bold().yellow());
         }
 
         Commands::Install { target } => match target {
@@ -816,6 +1063,8 @@ fn main() {
                 opencode_api_key: api_key.clone(),
                 max_retries: *max_retries,
                 warp_reset_delay_ms: *warp_delay,
+                hook_on_429: None,
+                provider: load_config().provider,
             };
 
             println!("{} Proxy:      {}", "→".green(), listen.bold());
@@ -879,12 +1128,16 @@ fn main() {
             upstream,
             max_retries,
             warp_delay,
+            on_429,
         } => {
             print_banner();
             println!("{}", "OpenCode Watch Mode".bold().yellow());
             println!();
             println!("{} Monitoring: {}", "→".green(), upstream.bold());
             println!("{} Auto-reset: {} (attempts: {})", "→".green(), "enabled".green().bold(), max_retries.to_string().bold());
+            if let Some(hook) = on_429 {
+                println!("{} Hook on 429: {}", "→".green(), hook.bold().yellow());
+            }
             println!();
             println!("{}", "Watching for 429 rate limits...".dimmed());
             println!("{} Press Ctrl+C to stop", "Tip:".cyan());
@@ -893,13 +1146,15 @@ fn main() {
             let upstream_clone = upstream.clone();
             let max_retries_clone = *max_retries;
             let warp_delay_clone = *warp_delay;
+            let hook_clone = on_429.clone();
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async {
-                oplirex::watch::start_watch_mode(
+                oplirex::watch::start_watch_mode_with_hook(
                     &upstream_clone,
                     max_retries_clone,
                     warp_delay_clone,
+                    hook_clone,
                 )
                 .await
             }) {
@@ -908,56 +1163,169 @@ fn main() {
             }
         }
 
-        Commands::Daemon {
-            listen,
-            upstream,
-            api_key,
-            max_retries,
-            warp_delay,
-        } => {
-            print_banner();
-            println!("{}", "Daemon Mode".bold().magenta());
-            println!();
-            println!("{} Listening:  {}", "→".green(), listen.bold());
-            println!("{} Upstream:   {}", "→".green(), upstream.bold());
-            println!("{} Auto-reset: {} (attempts: {})", "→".green(), "enabled".green().bold(), max_retries.to_string().bold());
-            println!();
-            println!("{}", "Running as background daemon...".dimmed());
-            println!("{} The proxy will auto-reset rate limits silently", "Tip:".cyan());
-            println!();
-
-            let config = ProxyConfig {
-                listen_addr: listen.clone(),
-                opencode_base_url: upstream.clone(),
-                opencode_api_key: api_key.clone(),
-                max_retries: *max_retries,
-                warp_reset_delay_ms: *warp_delay,
-            };
-
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            if let Err(e) = rt.block_on(async {
-                oplirex::proxy::start_proxy_server(config).await
-            }) {
-                eprintln!("{} Daemon error: {}", "[ERROR]".red(), e);
-                std::process::exit(1);
+        Commands::Daemon { action } => match action {
+            DaemonAction::Start { listen, upstream, api_key, max_retries, warp_delay } => {
+                // Route to daemon.rs for background spawn, but also keep existing direct run as fallback
+                print_banner();
+                println!("{}", "Daemon Mode".bold().magenta());
+                println!();
+                println!("{} Listening:  {}", "→".green(), listen.bold());
+                println!("{} Upstream:   {}", "→".green(), upstream.bold());
+                println!("{} Auto-reset: {} (attempts: {})", "→".green(), "enabled".green().bold(), max_retries.to_string().bold());
+                println!();
+                // try daemonized spawn via daemon.rs; if verbose show action
+                if cli.verbose {
+                    eprintln!("{} Attempting daemonized spawn via oplirex::daemon::daemon_start()", "[DEBUG]".yellow());
+                }
+                let cfg = ProxyConfig {
+                    listen_addr: listen.clone(),
+                    opencode_base_url: upstream.clone(),
+                    opencode_api_key: api_key.clone(),
+                    max_retries: *max_retries,
+                    warp_reset_delay_ms: *warp_delay,
+                    hook_on_429: None,
+                    provider: load_config().provider,
+                };
+                // First try background spawn helper (minimal viable). If it fails, fall back to foreground proxy.
+                match oplirex::daemon::daemon_start_with_config(&cfg) {
+                    Ok(msg) => {
+                        println!("{} {}", "✓".green().bold(), msg);
+                        println!("{}", "Proxy running in background (daemon). Use `oplire daemon status/stop` to manage.".dimmed());
+                        // also optionally keep foreground if spawn indicates detached failure - do nothing
+                    }
+                    Err(e) => {
+                        if cli.verbose { eprintln!("{} daemon_start failed ({}), falling back to foreground", "[WARN]".yellow(), e); }
+                        println!("{}", "Running as foreground daemon (fallback)...".dimmed());
+                        println!("{} The proxy will auto-reset rate limits silently", "Tip:".cyan());
+                        println!();
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        if let Err(err) = rt.block_on(async { oplirex::proxy::start_proxy_server(cfg).await }) {
+                            eprintln!("{} Daemon error: {}", "[ERROR]".red(), err);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            DaemonAction::Stop {} => {
+                println!("{}", "Stopping daemon...".bold());
+                // Try to stop service if installed, otherwise hint to kill process
+                match oplirex::daemon::service_status() {
+                    Ok(s) => println!("{} Service status: {}", "→".cyan(), s.dimmed()),
+                    Err(e) => eprintln!("{} {}", "[WARN]".yellow(), e),
+                }
+                // Best-effort pkill
+                let _ = Command::new("pkill").args(["-f", "oplirex.*proxy"]).output();
+                #[cfg(target_os = "windows")]
+                { let _ = Command::new("taskkill").args(["/IM", "oplirex.exe", "/F"]).output(); }
+                println!("{}", "Daemon stop signal sent (if running)".green().bold());
+            }
+            DaemonAction::Install {} => {
+                print_banner();
+                println!("{}", "Installing daemon service...".bold().green());
+                match oplirex::daemon::install_service() {
+                    Ok(msg) => println!("{} {}", "✓".green().bold(), msg),
+                    Err(e) => { eprintln!("{} {}", "[ERROR]".red(), e); std::process::exit(1); }
+                }
+            }
+            DaemonAction::Uninstall {} => {
+                print_banner();
+                println!("{}", "Uninstalling daemon service...".bold().yellow());
+                match oplirex::daemon::uninstall_service() {
+                    Ok(msg) => println!("{} {}", "✓".green().bold(), msg),
+                    Err(e) => { eprintln!("{} {}", "[ERROR]".red(), e); std::process::exit(1); }
+                }
+            }
+            DaemonAction::Status {} => {
+                match oplirex::daemon::service_status() {
+                    Ok(s) => println!("{} {}", "Daemon status:".bold(), s),
+                    Err(e) => eprintln!("{} {}", "[ERROR]".red(), e),
+                }
+                // also show port check
+                let port_available = std::net::TcpListener::bind("127.0.0.1:8080").is_ok();
+                println!("{} Port 8080: {}", "→".cyan(), if port_available { "available".green().bold() } else { "IN USE".red().bold() });
             }
         }
 
-        Commands::Doctor {} => {
+        Commands::Doctor { json, verbose, upstream } => {
+            let is_verbose = *verbose || cli.verbose;
+            // Gather checks
+            let warp_ok = warp_installed;
+            let warp_detail = if warp_ok { "installed".to_string() } else { "NOT FOUND".to_string() };
+            let warp_version = if warp_ok {
+                run_command("warp-cli", &["--version"], false, false).map(|v| v.trim().to_string()).unwrap_or_else(|_| "unknown".to_string())
+            } else { String::new() };
+
+            let cfg_path = config_path();
+            let cfg_exists = cfg_path.exists();
+            let loaded_cfg = load_config();
+            // use CLI upstream if provided different from default, else use config upstream
+            let effective_upstream = if upstream != "http://localhost:3000" { upstream.clone() } else { loaded_cfg.upstream.clone() };
+            let opencode_installed = check_opencode_installed();
+            let opencode_running = check_opencode_running(&effective_upstream);
+            let port_available = std::net::TcpListener::bind("127.0.0.1:8080").is_ok();
+            let port_in_use = !port_available;
+
+            if *json {
+                let out = serde_json::json!({
+                    "warp": {
+                        "installed": warp_ok,
+                        "detail": warp_detail,
+                        "version": warp_version,
+                        "ok": warp_ok
+                    },
+                    "opencode": {
+                        "installed": opencode_installed,
+                        "reachable": opencode_running,
+                        "upstream": effective_upstream,
+                        "ok": opencode_installed && opencode_running
+                    },
+                    "config": {
+                        "path": cfg_path.display().to_string(),
+                        "exists": cfg_exists,
+                        "listen": loaded_cfg.listen,
+                        "upstream": loaded_cfg.upstream,
+                        "ok": true
+                    },
+                    "port": {
+                        "port": 8080,
+                        "available": port_available,
+                        "in_use": port_in_use,
+                        "ok": port_available
+                    }
+                });
+                if is_verbose {
+                    let mut verbose_out = out.clone();
+                    verbose_out["verbose"] = serde_json::json!(true);
+                    verbose_out["checks"] = serde_json::json!({
+                        "warp_cli": warp_ok,
+                        "opencode_installed": opencode_installed,
+                        "opencode_health": opencode_running,
+                        "config_exists": cfg_exists,
+                        "port_available": port_available
+                    });
+                    println!("{}", serde_json::to_string_pretty(&verbose_out).unwrap());
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                }
+                return;
+            }
+
+            // human readable path
             print_banner();
             println!("{}", "System Diagnostics".bold().cyan());
             println!();
-
+            if is_verbose {
+                eprintln!("{} Doctor verbose: warp={}, opencode_installed={}, opencode_running={}, config={}, port_available={}", "[DEBUG]".yellow(), warp_ok, opencode_installed, opencode_running, cfg_exists, port_available);
+            }
             let mut all_ok = true;
-            let mut checks = Vec::new();
-
-            if warp_installed {
-                checks.push(("WARP CLI", "installed".to_string(), true));
+            let mut checks: Vec<(&str, String, bool)> = Vec::new();
+            if warp_ok {
+                let v = if !warp_version.is_empty() { format!("installed ({})", warp_version) } else { "installed".to_string() };
+                checks.push(("WARP CLI", v, true));
             } else {
                 checks.push(("WARP CLI", "NOT FOUND".to_string(), false));
                 all_ok = false;
             }
-
             if check_claude_installed() {
                 let version = run_command("claude", &["--version"], false, false)
                     .map(|v| v.trim().to_string())
@@ -965,48 +1333,35 @@ fn main() {
                 checks.push(("Claude Code", format!("installed ({})", version), true));
             } else {
                 checks.push(("Claude Code", "NOT FOUND".to_string(), false));
-                all_ok = false;
+                // not fatal for doctor
             }
-
-            if check_opencode_installed() {
+            if opencode_installed {
                 checks.push(("OpenCode", "installed".to_string(), true));
             } else {
                 checks.push(("OpenCode", "NOT FOUND".to_string(), false));
                 all_ok = false;
             }
-
-            let config = load_config();
-            let upstream = config.upstream.clone();
-            if check_opencode_running(&upstream) {
-                checks.push(("OpenCode Zen", format!("running ({})", upstream), true));
+            if opencode_running {
+                checks.push(("OpenCode Zen", format!("running ({})", effective_upstream), true));
             } else {
-                checks.push(("OpenCode Zen", format!("NOT REACHABLE ({})", upstream), false));
+                checks.push(("OpenCode Zen", format!("NOT REACHABLE ({})", effective_upstream), false));
                 all_ok = false;
             }
-
-            let cfg_path = config_path();
-            if cfg_path.exists() {
+            if cfg_exists {
                 checks.push(("Config file", format!("found ({})", cfg_path.display()), true));
             } else {
                 checks.push(("Config file", "using defaults".to_string(), true));
             }
-
-            if std::net::TcpListener::bind("127.0.0.1:8080").is_ok() {
+            if port_available {
                 checks.push(("Port 8080", "available".to_string(), true));
             } else {
                 checks.push(("Port 8080", "IN USE".to_string(), false));
                 all_ok = false;
             }
-
             for (name, status, ok) in &checks {
-                let status_str = if *ok {
-                    status.green().bold()
-                } else {
-                    status.red().bold()
-                };
+                let status_str = if *ok { status.green().bold() } else { status.red().bold() };
                 println!("{} {}: {}", "→".cyan(), name.bold(), status_str);
             }
-
             println!();
             if all_ok {
                 println!("{}", "All checks passed!".green().bold());
@@ -1056,6 +1411,8 @@ fn main() {
                 println!();
                 println!("{} {}", "Listen:".bold(), config.listen);
                 println!("{} {}", "Upstream:".bold(), config.upstream);
+                println!("{} {}", "Provider:".bold(), config.provider.to_string());
+                println!("{} {}", "API Key:".bold(), if config.api_key.is_some() { "*** set" } else { "(none)" });
                 println!("{} {}", "Max Retries:".bold(), config.max_retries);
                 println!("{} {}ms", "WARP Delay:".bold(), config.warp_delay);
                 println!("{} {}", "Config file:".bold(), config_path().display());
@@ -1107,6 +1464,7 @@ fn main() {
             api_key,
             max_retries,
             warp_delay,
+            on_429,
         } => {
             let config = ProxyConfig {
                 listen_addr: listen.clone(),
@@ -1114,6 +1472,8 @@ fn main() {
                 opencode_api_key: api_key.clone(),
                 max_retries: *max_retries,
                 warp_reset_delay_ms: *warp_delay,
+                hook_on_429: on_429.clone(),
+                provider: load_config().provider,
             };
 
             print_banner();
@@ -1288,6 +1648,47 @@ fn main() {
             println!("{} Run `oplire reset` to restart", "Tip:".cyan());
         }
 
+        Commands::Update { check, force } => {
+            if *check {
+                println!("{}", "Checking for updates...".dimmed());
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                match rt.block_on(oplirex::update::check_update()) {
+                    Ok(msg) => println!("{} {}", "→".green(), msg.bold()),
+                    Err(e) => {
+                        eprintln!("{} {}", "[ERROR]".red(), e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", "Self-updating...".bold().cyan());
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                match rt.block_on(oplirex::update::self_update(*force)) {
+                    Ok(msg) => println!("{} {}", "✓".green().bold(), msg),
+                    Err(e) => {
+                        eprintln!("{} {}", "[ERROR]".red(), e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Commands::Hook { on_429 } => {
+            if let Some(cmd) = on_429 {
+                println!("{} Hook on_429: {}", "→".cyan(), cmd.bold().yellow());
+                // demo run
+                let env = oplirex::hooks::HookEnv {
+                    warp_ip: Some("127.0.0.1".to_string()),
+                    retry_count: 1,
+                    ..Default::default()
+                };
+                oplirex::hooks::run_hook(cmd, env);
+                println!("{}", "Hook triggered (non-blocking)".green());
+            } else {
+                println!("{}", "No hook configured".yellow());
+                println!("Usage: oplire hook --on-429 \"echo 429 hit $RETRY_COUNT\"");
+                println!("   or: oplire proxy --on-429 \"...\"");
+                println!("       oplire watch --on-429 \"...\"");
+            }
+        }
         Commands::About {} => {
             print_banner();
             println!();
@@ -1326,10 +1727,15 @@ fn main() {
             println!("  oplire config set          # Save config");
             println!("  oplire config reset        # Reset to defaults");
             println!("  oplire doctor              # Diagnose system setup");
+            println!();
+            println!("{}", "Updates & Hooks:".bold());
+            println!("  oplire update              # Self-update to latest release");
+            println!("  oplire update --check      # Check for updates only");
+            println!("  oplire hook --on-429 \"cmd\" # Test 429 hook");
         }
     }
 
-    if !matches!(&cli.command, Commands::About {} | Commands::Proxy { .. } | Commands::Connect { .. } | Commands::Daemon { .. } | Commands::Watch { .. } | Commands::Doctor {} | Commands::Config { .. } | Commands::Setup {} | Commands::Install { .. } | Commands::Models { .. }) {
+    if !matches!(&cli.command, Commands::About {} | Commands::Proxy { .. } | Commands::Connect { .. } | Commands::Daemon { .. } | Commands::Watch { .. } | Commands::Doctor { .. } | Commands::Config { .. } | Commands::Setup {} | Commands::Install { .. } | Commands::Models { .. } | Commands::Update { .. } | Commands::Hook { .. }) {
         println!("\n{} v{}", "oplire".bold(), VERSION.dimmed());
     }
 }
