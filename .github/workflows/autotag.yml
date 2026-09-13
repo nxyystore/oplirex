@@ -2,7 +2,8 @@ name: Auto Tag on Release Commit
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,8 +17,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Use PAT so tag push triggers build.yml (GITHUB_TOKEN pushes don't trigger). Fallback to GITHUB_TOKEN if GH_PAT not set.
-          token: ${{ secrets.GH_PAT != '' && secrets.GH_PAT }}
+          # Use PAT so tag push triggers build.yml (GITHUB_TOKEN pushes don't trigger). Falls back to GITHUB_TOKEN if GH_PAT not set.
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Parse commit message for release/bump version
         id: parse
@@ -60,10 +61,10 @@ jobs:
           fi
 
           git tag "$TAG"
-          # Push commit + tag. Uses token from checkout (GH_PAT if set, otherwise GITHUB_TOKEN).
-          # NOTE: GITHUB_TOKEN pushes do NOT trigger other workflows (build.yml). Create a PAT
-          # with repo + workflow scopes and add as GH_PAT secret to auto-trigger releases.
-          git push origin HEAD:main --follow-tags || git push origin HEAD --follow-tags
+          # Push commit + tag (works for both main/master). Uses token from checkout.
+          # NOTE: GITHUB_TOKEN pushes do NOT trigger other workflows (build.yml). Add GH_PAT to auto-trigger.
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git push origin "HEAD:$BRANCH" --follow-tags || git push origin HEAD --follow-tags
 
       - name: Summary
         if: steps.parse.outputs.ver == ''
