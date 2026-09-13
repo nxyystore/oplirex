@@ -97,7 +97,8 @@ pub fn daemon_start() -> Result<String, String> {
 }
 
 /// Variant that accepts a ProxyConfig for callers that want to pass explicit
-/// listen/upstream. Currently just delegates to daemon_start() with env passing.
+/// listen/upstream. Forwards the full runtime config so the background daemon
+/// behaves exactly like the foreground `proxy` invocation.
 pub fn daemon_start_with_config(cfg: &crate::config::ProxyConfig) -> Result<String, String> {
     let exe = current_exe_string();
     let mut cmd = Command::new(&exe);
@@ -106,7 +107,32 @@ pub fn daemon_start_with_config(cfg: &crate::config::ProxyConfig) -> Result<Stri
         .arg(&cfg.listen_addr)
         .arg("--upstream")
         .arg(&cfg.opencode_base_url)
-        .stdin(std::process::Stdio::null())
+        .arg("--max-retries")
+        .arg(cfg.max_retries.to_string())
+        .arg("--warp-delay")
+        .arg(cfg.warp_reset_delay_ms.to_string())
+        .arg("--provider")
+        .arg(cfg.provider.to_string())
+        .arg("--circuit-threshold")
+        .arg(cfg.circuit_threshold.to_string())
+        .arg("--circuit-cooldown")
+        .arg(cfg.circuit_cooldown_secs.to_string());
+    if let Some(key) = &cfg.opencode_api_key {
+        cmd.arg("--api-key").arg(key);
+    }
+    if let Some(hook) = &cfg.hook_on_429 {
+        cmd.arg("--on-429").arg(hook);
+    }
+    if let Some(key) = &cfg.require_api_key {
+        cmd.arg("--require-key").arg(key);
+    }
+    for upstream in &cfg.extra_upstreams {
+        cmd.arg("--extra-upstream").arg(upstream);
+    }
+    for model in &cfg.fallback_models {
+        cmd.arg("--fallback-model").arg(model);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     #[cfg(target_os = "windows")]

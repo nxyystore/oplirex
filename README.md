@@ -16,7 +16,9 @@
 **oplirex** is a dual-purpose tool:
 
 1. **WARP Rate Limit Reset** - Rotates your IP via Cloudflare WARP to reset OpenCode rate limits
-2. **Anthropic Proxy Bridge** - Reverse proxy that connects Claude Code to OpenCode Zen's free models with automatic rate limit recovery
+2. **OpenCode Proxy Daemon** - Reverse proxy in front of OpenCode with automatic rate limit recovery, serving both API dialects:
+   - `POST /v1/messages` (Anthropic — Claude Code)
+   - `POST /v1/chat/completions` (OpenAI — opencode CLI, OpenAI SDKs, passed through untouched)
 
 ### How It Works
 
@@ -31,12 +33,12 @@ OpenCode tracks users by IP. When you hit the rate limit:
 
 #### Proxy Bridge Mode
 
-Claude Code → oplire proxy (127.0.0.1:8080) → OpenCode Zen
+Any client → oplire proxy (127.0.0.1:8080) → OpenCode Zen
 
-- Translates Anthropic API format to OpenAI format
-- Streams SSE responses in real-time
+- Anthropic clients (`/v1/messages`): translates Anthropic API format to OpenAI format, streams SSE responses in real-time
+- OpenAI clients (`/v1/chat/completions`): passed through untouched (native opencode / OpenAI-SDK shape, streaming relayed as-is)
 - Exposes free models via `/v1/models` endpoint
-- **Auto-resets WARP** on 429 rate limits — transparently
+- **Auto-resets WARP** on 429 rate limits — transparently, for both dialects
 
 ## Installation
 
@@ -91,10 +93,64 @@ oplirex install        # Install Cloudflare WARP
 ### Proxy Commands
 
 ```bash
-oplirex proxy                          # Start reverse proxy on :8080
+oplirex proxy                          # Start proxy daemon on :8080 (both API dialects)
 oplirex proxy --listen 0.0.0.0:9000    # Custom listen address
+oplirex proxy --extra-upstream http://host2:3000   # Round-robin across upstreams (repeatable)
+oplirex proxy --fallback-model kimi-k2.5-free      # Try this model after 429s (repeatable)
+oplirex proxy --require-key s3cret                 # Require a client API key
 oplirex daemon                         # Background daemon mode
 oplirex watch                          # Monitor OpenCode, auto-reset on 429
+```
+
+### Reliability: failover, circuit breaker, preemptive rotation
+
+```bash
+# Failover: when the requested model 429s past its retries, the proxy tries
+# each --fallback-model in order (also settable via config file).
+oplirex proxy --fallback-model kimi-k2.5-free --fallback-model glm-4.7-free
+
+# Circuit breaker: after N consecutive 429s the proxy returns 503 for a
+# cooldown instead of hammering the upstream. /health reports open/degraded.
+oplirex proxy --circuit-threshold 5 --circuit-cooldown 60
+
+# Preemptive rotation: `watch` polls the upstream and rotates WARP early when
+# it sees low rate-limit headers or a trend of 429s — before traffic fails.
+oplirex watch --preemptive-window 10 --preemptive-threshold 3
+
+# Observability: open http://127.0.0.1:8080/dashboard (token usage per model,
+# recent requests, WARP history) or GET /_oplire/metrics. Both are key-gated
+# when --require-key is set (pass ?key=... in the browser).
+
+# Hot-reload the proxy after `config set` — no restart needed:
+curl -X POST http://127.0.0.1:8080/_oplire/reload
+# Daemon also reloads on SIGHUP:  kill -HUP $(pgrep oplirex)
+```
+
+### Direct opencode Usage
+
+```bash
+# One command: starts proxy daemon + launches opencode routed through it
+oplirex connect opencode
+
+# With specific model (+ extra args passed to opencode after --)
+oplirex connect opencode --model glm-4.7-free -- --print "hello"
+
+# Or point any OpenAI-compatible client at the daemon manually:
+oplirex daemon &
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=oplire-proxy-key
+opencode
+```
+
+### opencode provider snippet
+
+`connect opencode` can write the `provider.oplire` subtree for your
+`opencode.json` so the model is selectable inside opencode directly:
+
+```bash
+oplirex connect opencode --model glm-4.7-free \
+  --provider-config ./oplire-provider.json
+# then merge provider.oplire from that file into your opencode.json
 ```
 
 ### Configuration
@@ -103,6 +159,17 @@ oplirex watch                          # Monitor OpenCode, auto-reset on 429
 oplirex config show    # Show current settings
 oplirex config set     # Save configuration
 oplirex config reset   # Reset to defaults
+
+# config set persists the proxy options too (used as defaults by every command):
+oplirex config set --upstream http://localhost:3000 \
+  --extra-upstream http://host2:3000 \
+  --fallback-model kimi-k2.5-free \
+  --require-key s3cret \
+  --circuit-threshold 5 --circuit-cooldown 60 \
+  --hook "notify-me.sh" \
+  --preemptive-window 10 --preemptive-threshold 3
+# (empty string clears --require-key / --hook; the proxy picks up changes via
+# POST /_oplire/reload or SIGHUP — no restart needed)
 ```
 
 ### Diagnostics

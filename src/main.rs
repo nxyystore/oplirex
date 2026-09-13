@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use oplirex::{ProxyConfig, AppConfig};
+use oplirex::{providers::Provider, AppConfig, ProxyConfig};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -52,6 +52,24 @@ enum Commands {
         warp_delay: u64,
         #[arg(long, value_name = "CMD")]
         on_429: Option<String>,
+        /// Additional upstreams for round-robin (repeatable). Falls back to config file.
+        #[arg(long = "extra-upstream")]
+        extra_upstreams: Vec<String>,
+        /// Fallback models tried in order after 429s (repeatable). Falls back to config file.
+        #[arg(long = "fallback-model")]
+        fallback_models: Vec<String>,
+        /// Require this key from clients (Authorization: Bearer / x-api-key). Falls back to config file.
+        #[arg(long = "require-key")]
+        require_key: Option<String>,
+        /// Consecutive 429s that trip the circuit breaker. Falls back to config file.
+        #[arg(long = "circuit-threshold")]
+        circuit_threshold: Option<u32>,
+        /// Circuit breaker cooldown in seconds. Falls back to config file.
+        #[arg(long = "circuit-cooldown")]
+        circuit_cooldown: Option<u64>,
+        /// Upstream provider dialect (opencode, openai, anthropic). Defaults to config file.
+        #[arg(long)]
+        provider: Option<String>,
     },
     Connect {
         #[command(subcommand)]
@@ -66,6 +84,12 @@ enum Commands {
         warp_delay: u64,
         #[arg(long, value_name = "CMD")]
         on_429: Option<String>,
+        /// Polls in the preemptive trend window. Falls back to config file.
+        #[arg(long = "preemptive-window")]
+        preemptive_window: Option<usize>,
+        /// 429s inside the window that trigger early rotation. Falls back to config file.
+        #[arg(long = "preemptive-threshold")]
+        preemptive_threshold: Option<u32>,
     },
     Daemon {
         #[command(subcommand)]
@@ -129,12 +153,69 @@ enum ConnectTarget {
         model: Option<String>,
         #[arg(long)]
         system_prompt: Option<String>,
+        /// Additional upstreams for round-robin (repeatable). Falls back to config file.
+        #[arg(long = "extra-upstream")]
+        extra_upstreams: Vec<String>,
+        /// Fallback models tried in order after 429s (repeatable). Falls back to config file.
+        #[arg(long = "fallback-model")]
+        fallback_models: Vec<String>,
+        /// Require this key from clients. Falls back to config file.
+        #[arg(long = "require-key")]
+        require_key: Option<String>,
+        #[arg(long = "circuit-threshold")]
+        circuit_threshold: Option<u32>,
+        #[arg(long = "circuit-cooldown")]
+        circuit_cooldown: Option<u64>,
+        /// Upstream provider dialect (opencode, openai, anthropic). Defaults to config file.
+        #[arg(long)]
+        provider: Option<String>,
         #[arg(last = true)]
         claude_args: Vec<String>,
+    },
+    /// Start the proxy daemon and launch the opencode CLI routed through it.
+    ///
+    /// opencode speaks OpenAI-compatible `POST /v1/chat/completions`, which
+    /// the proxy forwards untouched (no Anthropic translation) with the same
+    /// automatic WARP reset on 429s. Extra args after `--` are passed to `opencode`.
+    Opencode {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        #[arg(long, default_value = "http://localhost:3000")]
+        upstream: String,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "3")]
+        max_retries: u32,
+        #[arg(long, default_value = "5000")]
+        warp_delay: u64,
+        #[arg(long)]
+        model: Option<String>,
+        /// Additional upstreams for round-robin (repeatable). Falls back to config file.
+        #[arg(long = "extra-upstream")]
+        extra_upstreams: Vec<String>,
+        /// Fallback models tried in order after 429s (repeatable). Falls back to config file.
+        #[arg(long = "fallback-model")]
+        fallback_models: Vec<String>,
+        /// Require this key from clients. Falls back to config file.
+        #[arg(long = "require-key")]
+        require_key: Option<String>,
+        #[arg(long = "circuit-threshold")]
+        circuit_threshold: Option<u32>,
+        #[arg(long = "circuit-cooldown")]
+        circuit_cooldown: Option<u64>,
+        /// Upstream provider dialect (opencode, openai, anthropic). Defaults to config file.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Write an opencode.json provider snippet for the proxy to this path.
+        #[arg(long = "provider-config")]
+        provider_config: Option<String>,
+        #[arg(last = true)]
+        opencode_args: Vec<String>,
     },
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)] // Set carries the full proxy option set by design
 enum ConfigAction {
     Show {},
     Set {
@@ -148,11 +229,32 @@ enum ConfigAction {
         max_retries: u32,
         #[arg(long, default_value = "5000")]
         warp_delay: u64,
+        /// Additional upstreams for round-robin (repeatable, replaces file list).
+        #[arg(long = "extra-upstream")]
+        extra_upstreams: Vec<String>,
+        /// Fallback models tried in order after 429s (repeatable, replaces file list).
+        #[arg(long = "fallback-model")]
+        fallback_models: Vec<String>,
+        /// Client key the proxy requires (empty string clears it).
+        #[arg(long = "require-key")]
+        require_key: Option<String>,
+        #[arg(long = "circuit-threshold")]
+        circuit_threshold: Option<u32>,
+        #[arg(long = "circuit-cooldown")]
+        circuit_cooldown: Option<u64>,
+        /// Hook command run on every 429 (empty string clears it).
+        #[arg(long)]
+        hook: Option<String>,
+        #[arg(long = "preemptive-window")]
+        preemptive_window: Option<usize>,
+        #[arg(long = "preemptive-threshold")]
+        preemptive_threshold: Option<u32>,
     },
     Reset {},
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)] // Start carries the full proxy option set by design
 enum DaemonAction {
     Start {
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -165,6 +267,22 @@ enum DaemonAction {
         max_retries: u32,
         #[arg(long, default_value = "5000")]
         warp_delay: u64,
+        /// Additional upstreams for round-robin (repeatable). Falls back to config file.
+        #[arg(long = "extra-upstream")]
+        extra_upstreams: Vec<String>,
+        /// Fallback models tried in order after 429s (repeatable). Falls back to config file.
+        #[arg(long = "fallback-model")]
+        fallback_models: Vec<String>,
+        /// Require this key from clients. Falls back to config file.
+        #[arg(long = "require-key")]
+        require_key: Option<String>,
+        #[arg(long = "circuit-threshold")]
+        circuit_threshold: Option<u32>,
+        #[arg(long = "circuit-cooldown")]
+        circuit_cooldown: Option<u64>,
+        /// Upstream provider dialect (opencode, openai, anthropic). Defaults to config file.
+        #[arg(long)]
+        provider: Option<String>,
     },
     Stop {},
     Install {},
@@ -337,6 +455,81 @@ fn save_config(config: &AppConfig) -> Result<(), String> {
     let content = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
     fs::write(&path, content).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Parse an optional `--provider` flag value.
+fn parse_provider_flag(value: &Option<String>) -> Provider {
+    match value {
+        None => load_config().provider,
+        Some(s) => s.parse::<Provider>().unwrap_or_else(|e| {
+            eprintln!("{} {}", "[ERROR]".red(), e);
+            std::process::exit(1);
+        }),
+    }
+}
+
+/// Build the runtime proxy config: explicit flags win, the config file fills
+/// every field the flags leave empty, hardcoded defaults cover the rest.
+#[allow(clippy::too_many_arguments)]
+fn build_proxy_config(
+    listen: &str,
+    upstream: &str,
+    api_key: &Option<String>,
+    max_retries: u32,
+    warp_delay: u64,
+    on_429: &Option<String>,
+    extra_upstreams: &[String],
+    fallback_models: &[String],
+    require_key: &Option<String>,
+    circuit_threshold: Option<u32>,
+    circuit_cooldown: Option<u64>,
+    provider: Option<Provider>,
+) -> ProxyConfig {
+    let file = load_config();
+    ProxyConfig {
+        listen_addr: listen.to_string(),
+        opencode_base_url: upstream.to_string(),
+        opencode_api_key: api_key.clone(),
+        max_retries,
+        warp_reset_delay_ms: warp_delay,
+        hook_on_429: on_429.clone().or(file.hook_on_429),
+        provider: provider.unwrap_or(file.provider),
+        extra_upstreams: if extra_upstreams.is_empty() {
+            file.extra_upstreams
+        } else {
+            extra_upstreams.to_vec()
+        },
+        require_api_key: require_key.clone().or(file.require_api_key),
+        fallback_models: if fallback_models.is_empty() {
+            file.fallback_models
+        } else {
+            fallback_models.to_vec()
+        },
+        circuit_threshold: circuit_threshold.unwrap_or(file.circuit_threshold),
+        circuit_cooldown_secs: circuit_cooldown.unwrap_or(file.circuit_cooldown_secs),
+    }
+}
+
+/// Write an `opencode.json` provider snippet routing a model through the proxy.
+/// Prints a merge hint; the file contains only the `provider.oplire` subtree.
+fn write_opencode_provider_config(path: &str, listen: &str, model: &str) -> Result<(), String> {
+    let snippet = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {
+            "oplire": {
+                "options": {
+                    "baseURL": format!("http://{}/v1", listen),
+                    "apiKey": "oplire-proxy-key"
+                },
+                "models": {
+                    model: { "name": format!("{} (via oplire)", model) }
+                }
+            }
+        }
+    });
+    let content =
+        serde_json::to_string_pretty(&snippet).map_err(|e| e.to_string())?;
+    fs::write(path, content).map_err(|e| e.to_string())
 }
 
 fn check_warp_installed() -> bool {
@@ -1007,8 +1200,8 @@ fn main() {
             }
         },
 
-        Commands::Connect {
-            target: ConnectTarget::ClaudeCode {
+        Commands::Connect { target } => match target {
+            ConnectTarget::ClaudeCode {
                 listen,
                 upstream,
                 api_key,
@@ -1016,9 +1209,14 @@ fn main() {
                 warp_delay,
                 model,
                 system_prompt,
+                extra_upstreams,
+                fallback_models,
+                require_key,
+                circuit_threshold,
+                circuit_cooldown,
+                provider,
                 claude_args,
-            },
-        } => {
+            } => {
             print_banner();
             println!("{}", "Claude Code Bridge".bold().green());
             println!();
@@ -1057,15 +1255,20 @@ fn main() {
                 }
             };
 
-            let config = ProxyConfig {
-                listen_addr: listen.clone(),
-                opencode_base_url: upstream.clone(),
-                opencode_api_key: api_key.clone(),
-                max_retries: *max_retries,
-                warp_reset_delay_ms: *warp_delay,
-                hook_on_429: None,
-                provider: load_config().provider,
-            };
+            let config = build_proxy_config(
+                listen,
+                upstream,
+                api_key,
+                *max_retries,
+                *warp_delay,
+                &None,
+                extra_upstreams,
+                fallback_models,
+                require_key,
+                *circuit_threshold,
+                *circuit_cooldown,
+                Some(parse_provider_flag(provider)),
+            );
 
             println!("{} Proxy:      {}", "→".green(), listen.bold());
             println!("{} Upstream:   {}", "→".green(), upstream.bold());
@@ -1087,7 +1290,11 @@ fn main() {
             let proxy_handle = std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    oplirex::proxy::start_proxy_server(proxy_config).await
+                    oplirex::proxy::start_proxy_server_with_config_file(
+                        proxy_config,
+                        Some(config_path()),
+                    )
+                    .await
                 })
             });
 
@@ -1122,6 +1329,157 @@ fn main() {
             println!("{} Shutting down proxy...", "→".green().dimmed());
 
             drop(proxy_handle);
+            }
+            ConnectTarget::Opencode {
+                listen,
+                upstream,
+                api_key,
+                max_retries,
+                warp_delay,
+                model,
+                extra_upstreams,
+                fallback_models,
+                require_key,
+                circuit_threshold,
+                circuit_cooldown,
+                provider,
+                provider_config,
+                opencode_args,
+            } => {
+                print_banner();
+                println!("{}", "opencode Proxy Daemon".bold().green());
+                println!();
+
+                if !check_opencode_installed() {
+                    eprintln!("{} opencode not found in PATH", "[ERROR]".red());
+                    eprintln!("{} Install: {}", "Fix:".cyan(), "oplire install opencode".bold().yellow());
+                    std::process::exit(1);
+                }
+
+                let selected_model = match model {
+                    Some(m) => m.clone(),
+                    None => {
+                        println!("{} Fetching models from {}...", "→".cyan(), upstream.bold());
+                        match fetch_models(upstream) {
+                            Ok(models) => {
+                                if models.is_empty() {
+                                    println!("{} No models found, using default", "[WARN]".yellow());
+                                    String::new()
+                                } else {
+                                    match select_model_interactively(&models) {
+                                        Some(id) => id,
+                                        None => {
+                                            println!("{} No selection made, using default", "[WARN]".yellow());
+                                            String::new()
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("{} Failed to fetch models: {}", "[WARN]".yellow(), e);
+                                println!("{} Starting without model selection", "Tip:".cyan());
+                                String::new()
+                            }
+                        }
+                    }
+                };
+
+                let config = build_proxy_config(
+                    listen,
+                    upstream,
+                    api_key,
+                    *max_retries,
+                    *warp_delay,
+                    &None,
+                    extra_upstreams,
+                    fallback_models,
+                    require_key,
+                    *circuit_threshold,
+                    *circuit_cooldown,
+                    Some(parse_provider_flag(provider)),
+                );
+
+                println!("{} Proxy:      {}", "→".green(), listen.bold());
+                println!("{} Upstream:   {}", "→".green(), upstream.bold());
+                println!("{} Auto-reset: {} (attempts: {})", "→".green(), "enabled".green().bold(), max_retries.to_string().bold());
+                if !selected_model.is_empty() {
+                    println!("{} Model:     {}", "→".green(), selected_model.bold());
+                }
+                println!();
+                println!("{}", "OpenAI endpoint:".dimmed());
+                println!("  {}", format!("http://{}/v1/chat/completions", listen).bold().yellow());
+                println!("{}", "Anthropic endpoint:".dimmed());
+                println!("  {}", format!("http://{}/v1/messages", listen).bold().yellow());
+                println!();
+
+                if let Some(cfg_path) = provider_config {
+                    let model_name = if selected_model.is_empty() {
+                        "glm-4.7-free"
+                    } else {
+                        selected_model.as_str()
+                    };
+                    match write_opencode_provider_config(cfg_path, listen, model_name) {
+                        Ok(()) => {
+                            println!("{} Wrote opencode provider snippet to {}", "→".green(), cfg_path.bold());
+                            println!("{} Merge its {} subtree into your opencode.json", "Tip:".cyan(), "provider.oplire".bold());
+                        }
+                        Err(e) => {
+                            eprintln!("{} Failed to write provider config: {}", "[ERROR]".red(), e);
+                            std::process::exit(1);
+                        }
+                    }
+                    println!();
+                }
+
+                println!("{}", "Starting proxy server...".dimmed());
+
+                let proxy_config = config.clone();
+                let listen_clone = listen.clone();
+                let model_clone = selected_model.clone();
+
+                let proxy_handle = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        oplirex::proxy::start_proxy_server_with_config_file(
+                            proxy_config,
+                            Some(config_path()),
+                        )
+                        .await
+                    })
+                });
+
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+
+                println!("{}", "Launching opencode...".dimmed());
+                println!();
+
+                let mut cmd = Command::new("opencode");
+                // Route opencode's OpenAI-compatible calls through the proxy
+                // daemon so 429s trigger transparent WARP resets.
+                cmd.env("OPENAI_BASE_URL", format!("http://{}/v1", listen_clone))
+                    .env("OPENAI_API_KEY", "oplire-proxy-key")
+                    .env("ANTHROPIC_BASE_URL", format!("http://{}", listen_clone))
+                    .env("ANTHROPIC_API_KEY", "oplire-proxy-key");
+
+                if !model_clone.is_empty() {
+                    cmd.env("OPENCODE_MODEL", &model_clone);
+                }
+
+                if !opencode_args.is_empty() {
+                    cmd.args(opencode_args);
+                }
+
+                let status = cmd.status().map_err(|e| e.to_string()).unwrap_or_else(|_| {
+                    eprintln!("{} Failed to launch opencode", "[ERROR]".red());
+                    std::process::exit(1);
+                });
+
+                println!();
+                println!("{} opencode exited with: {}", "Info:".cyan(), status.to_string().bold());
+                println!("{} Shutting down proxy...", "→".green().dimmed());
+
+                drop(proxy_handle);
+            }
         }
 
         Commands::Watch {
@@ -1129,6 +1487,8 @@ fn main() {
             max_retries,
             warp_delay,
             on_429,
+            preemptive_window,
+            preemptive_threshold,
         } => {
             print_banner();
             println!("{}", "OpenCode Watch Mode".bold().yellow());
@@ -1147,14 +1507,19 @@ fn main() {
             let max_retries_clone = *max_retries;
             let warp_delay_clone = *warp_delay;
             let hook_clone = on_429.clone();
+            let file_cfg = load_config();
+            let window_clone = preemptive_window.unwrap_or(file_cfg.preemptive_window);
+            let threshold_clone = preemptive_threshold.unwrap_or(file_cfg.preemptive_threshold);
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async {
-                oplirex::watch::start_watch_mode_with_hook(
+                oplirex::watch::start_watch_mode_full(
                     &upstream_clone,
                     max_retries_clone,
                     warp_delay_clone,
                     hook_clone,
+                    window_clone,
+                    threshold_clone,
                 )
                 .await
             }) {
@@ -1164,7 +1529,7 @@ fn main() {
         }
 
         Commands::Daemon { action } => match action {
-            DaemonAction::Start { listen, upstream, api_key, max_retries, warp_delay } => {
+            DaemonAction::Start { listen, upstream, api_key, max_retries, warp_delay, extra_upstreams, fallback_models, require_key, circuit_threshold, circuit_cooldown, provider } => {
                 // Route to daemon.rs for background spawn, but also keep existing direct run as fallback
                 print_banner();
                 println!("{}", "Daemon Mode".bold().magenta());
@@ -1177,15 +1542,20 @@ fn main() {
                 if cli.verbose {
                     eprintln!("{} Attempting daemonized spawn via oplirex::daemon::daemon_start()", "[DEBUG]".yellow());
                 }
-                let cfg = ProxyConfig {
-                    listen_addr: listen.clone(),
-                    opencode_base_url: upstream.clone(),
-                    opencode_api_key: api_key.clone(),
-                    max_retries: *max_retries,
-                    warp_reset_delay_ms: *warp_delay,
-                    hook_on_429: None,
-                    provider: load_config().provider,
-                };
+                let cfg = build_proxy_config(
+                    listen,
+                    upstream,
+                    api_key,
+                    *max_retries,
+                    *warp_delay,
+                    &None,
+                    extra_upstreams,
+                    fallback_models,
+                    require_key,
+                    *circuit_threshold,
+                    *circuit_cooldown,
+                    Some(parse_provider_flag(provider)),
+                );
                 // First try background spawn helper (minimal viable). If it fails, fall back to foreground proxy.
                 match oplirex::daemon::daemon_start_with_config(&cfg) {
                     Ok(msg) => {
@@ -1199,7 +1569,7 @@ fn main() {
                         println!("{} The proxy will auto-reset rate limits silently", "Tip:".cyan());
                         println!();
                         let rt = tokio::runtime::Runtime::new().unwrap();
-                        if let Err(err) = rt.block_on(async { oplirex::proxy::start_proxy_server(cfg).await }) {
+                        if let Err(err) = rt.block_on(async { oplirex::proxy::start_proxy_server_with_config_file(cfg, Some(config_path())).await }) {
                             eprintln!("{} Daemon error: {}", "[ERROR]".red(), err);
                             std::process::exit(1);
                         }
@@ -1415,6 +1785,12 @@ fn main() {
                 println!("{} {}", "API Key:".bold(), if config.api_key.is_some() { "*** set" } else { "(none)" });
                 println!("{} {}", "Max Retries:".bold(), config.max_retries);
                 println!("{} {}ms", "WARP Delay:".bold(), config.warp_delay);
+                println!("{} {}", "Extra Upstreams:".bold(), if config.extra_upstreams.is_empty() { "(none)".to_string() } else { config.extra_upstreams.join(", ") });
+                println!("{} {}", "Fallback Models:".bold(), if config.fallback_models.is_empty() { "(none)".to_string() } else { config.fallback_models.join(", ") });
+                println!("{} {}", "Require Key:".bold(), if config.require_api_key.is_some() { "*** set" } else { "(none)" });
+                println!("{} {}", "Circuit:".bold(), format!("{} consecutive 429s / {}s cooldown", config.circuit_threshold, config.circuit_cooldown_secs));
+                println!("{} {}", "Hook:".bold(), config.hook_on_429.as_deref().unwrap_or("(none)"));
+                println!("{} {}", "Preemptive:".bold(), format!("{} 429s / {} polls", config.preemptive_threshold, config.preemptive_window));
                 println!("{} {}", "Config file:".bold(), config_path().display());
             }
             ConfigAction::Set {
@@ -1423,6 +1799,14 @@ fn main() {
                 upstream,
                 max_retries,
                 warp_delay,
+                extra_upstreams,
+                fallback_models,
+                require_key,
+                circuit_threshold,
+                circuit_cooldown,
+                hook,
+                preemptive_window,
+                preemptive_threshold,
             } => {
                 let mut config = load_config();
 
@@ -1430,6 +1814,30 @@ fn main() {
                 config.upstream = upstream.clone();
                 config.max_retries = *max_retries;
                 config.warp_delay = *warp_delay;
+                if !extra_upstreams.is_empty() {
+                    config.extra_upstreams = extra_upstreams.clone();
+                }
+                if !fallback_models.is_empty() {
+                    config.fallback_models = fallback_models.clone();
+                }
+                if let Some(k) = require_key {
+                    config.require_api_key = if k.is_empty() { None } else { Some(k.clone()) };
+                }
+                if let Some(t) = circuit_threshold {
+                    config.circuit_threshold = *t;
+                }
+                if let Some(c) = circuit_cooldown {
+                    config.circuit_cooldown_secs = *c;
+                }
+                if let Some(h) = hook {
+                    config.hook_on_429 = if h.is_empty() { None } else { Some(h.clone()) };
+                }
+                if let Some(w) = preemptive_window {
+                    config.preemptive_window = *w;
+                }
+                if let Some(t) = preemptive_threshold {
+                    config.preemptive_threshold = *t;
+                }
 
                 match save_config(&config) {
                     Ok(()) => {
@@ -1465,19 +1873,30 @@ fn main() {
             max_retries,
             warp_delay,
             on_429,
+            extra_upstreams,
+            fallback_models,
+            require_key,
+            circuit_threshold,
+            circuit_cooldown,
+            provider,
         } => {
-            let config = ProxyConfig {
-                listen_addr: listen.clone(),
-                opencode_base_url: upstream.clone(),
-                opencode_api_key: api_key.clone(),
-                max_retries: *max_retries,
-                warp_reset_delay_ms: *warp_delay,
-                hook_on_429: on_429.clone(),
-                provider: load_config().provider,
-            };
+            let config = build_proxy_config(
+                listen,
+                upstream,
+                api_key,
+                *max_retries,
+                *warp_delay,
+                on_429,
+                extra_upstreams,
+                fallback_models,
+                require_key,
+                *circuit_threshold,
+                *circuit_cooldown,
+                Some(parse_provider_flag(provider)),
+            );
 
             print_banner();
-            println!("{}", "Anthropic ↔ OpenCode Zen Proxy".bold().cyan());
+            println!("{}", "OpenCode Proxy Daemon (Anthropic + OpenAI)".bold().cyan());
             println!();
             println!("{} Listening on: {}", "→".green(), listen.bold());
             println!("{} Upstream:     {}", "→".green(), upstream.bold());
@@ -1487,17 +1906,23 @@ fn main() {
                 max_retries.to_string().bold()
             );
             println!();
+            println!("{}", "Endpoints:".cyan().bold());
             println!(
-                "{} Configure Claude Code to use: {}",
-                "Tip:".cyan().bold(),
-                format!("http://{}", listen).yellow().bold()
+                "  {} {} (Claude Code)",
+                "Anthropic:".dimmed(),
+                format!("http://{}/v1/messages", listen).yellow().bold()
             );
-            println!("{} Or run: {}", "→".cyan(), "oplire connect claude-code".bold());
+            println!(
+                "  {} {} (opencode / OpenAI)",
+                "OpenAI:".dimmed(),
+                format!("http://{}/v1/chat/completions", listen).yellow().bold()
+            );
+            println!("{} Or run: {}", "→".cyan(), "oplire connect claude-code|opencode".bold());
             println!();
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async {
-                oplirex::proxy::start_proxy_server(config).await
+                oplirex::proxy::start_proxy_server_with_config_file(config, Some(config_path())).await
             }) {
                 eprintln!("{} Proxy server error: {}", "[ERROR]".red(), e);
                 std::process::exit(1);
@@ -1715,9 +2140,10 @@ fn main() {
             println!("  oplire quick-reset         # Fast WARP IP rotation");
             println!("  oplire stop                # Stop WARP tunnel");
             println!();
-            println!("{}", "Proxy & Claude Code:".bold());
-            println!("  oplire proxy               # Start reverse proxy");
+            println!("{}", "Proxy & Clients:".bold());
+            println!("  oplire proxy               # Start proxy daemon (Anthropic + OpenAI)");
             println!("  oplire connect claude-code # Proxy + launch Claude Code");
+            println!("  oplire connect opencode    # Proxy + launch opencode");
             println!("  oplire daemon              # Background proxy service");
             println!("  oplire watch               # Monitor OpenCode, auto-reset");
             println!();

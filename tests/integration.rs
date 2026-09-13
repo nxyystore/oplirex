@@ -11,7 +11,7 @@ use axum::{
 use oplirex::{
     config::ProxyConfig,
     metrics::Metrics,
-    proxy::handlers::{handle_messages, handle_models, ProxyState},
+    proxy::handlers::{handle_chat_completions, handle_messages, handle_models, ProxyState},
     transform::{anthropic_to_opencode_request, opencode_response_to_anthropic, opencode_stream_to_anthropic},
     warp::WarpResolver,
 };
@@ -67,7 +67,14 @@ async fn spawn_mock_upstream() -> String {
 }
 
 fn make_proxy_state(upstream: String) -> Arc<Mutex<ProxyState>> {
-    let config = ProxyConfig {
+    make_proxy_state_with(upstream, |_| {})
+}
+
+fn make_proxy_state_with(
+    upstream: String,
+    mutate: impl FnOnce(&mut ProxyConfig),
+) -> Arc<Mutex<ProxyState>> {
+    let mut config = ProxyConfig {
         listen_addr: "127.0.0.1:0".to_string(),
         opencode_base_url: upstream,
         opencode_api_key: None,
@@ -75,14 +82,16 @@ fn make_proxy_state(upstream: String) -> Arc<Mutex<ProxyState>> {
         warp_reset_delay_ms: 10,
         hook_on_429: None,
         provider: oplirex::providers::Provider::Opencode,
+        extra_upstreams: vec![],
+        require_api_key: None,
+        fallback_models: vec![],
+        circuit_threshold: 5,
+        circuit_cooldown_secs: 60,
     };
+    mutate(&mut config);
     let client = reqwest::Client::builder().build().unwrap();
     let warp_resolver = WarpResolver::new(2, 10);
-    Arc::new(Mutex::new(ProxyState {
-        config,
-        client,
-        warp_resolver,
-    }))
+    Arc::new(Mutex::new(ProxyState::new(config, client, warp_resolver)))
 }
 
 // ---------- transform tests ----------
@@ -288,8 +297,7 @@ async fn test_proxy_messages_non_streaming() {
 }
 
 #[tokio::test]
-async fn test_proxy_messages_invalid_json_returns_error() {
-    let upstream = spawn_mock_upstream().await;
+async fn test_proxy_messages_invalid_json_returns_error() {    let upstream = spawn_mock_upstream().await;
     let state = make_proxy_state(upstream);
     let app = Router::new()
         .route("/v1/messages", post(handle_messages))
@@ -302,7 +310,7 @@ async fn test_proxy_messages_invalid_json_returns_error() {
         .body(Body::from("not json"))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -319,6 +327,153 @@ async fn test_proxy_models_fallback_when_upstream_down() {
     let v: Value = serde_json::from_slice(&body).unwrap();
     // fallback has object=list
     assert!(v.get("object").is_some() || v.get("data").is_some());
+}
+
+// ---------- OpenAI passthrough (direct opencode daemon) ----------
+
+#[tokio::test]
+async fn test_chat_completions_passthrough_non_streaming() {
+    let upstream = spawn_mock_upstream().await;
+    let state = make_proxy_state(upstream);
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state);
+
+    // OpenAI-format body goes through untouched and comes back untouched
+    let payload = json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hello"}],
+        "temperature": 0.5
+    });
+
+    let req = Request::builder()
+        .uri("/v1/chat/completions")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    // NOT translated to Anthropic shape — raw OpenAI shape preserved
+    assert_eq!(v["object"], "chat.completion");
+    assert_eq!(v["id"], "chatcmpl-mock");
+    assert_eq!(v["model"], "gpt-4o-mini");
+    assert_eq!(v["choices"][0]["message"]["content"], "hello from mock");
+    assert!(v.get("type").is_none());
+}
+
+#[tokio::test]
+async fn test_chat_completions_streaming_passthrough() {
+    // Mock upstream with an SSE streaming endpoint
+    let app_upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let sse = "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                Body::from(sse.to_string()),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app_upstream).await.unwrap();
+    });
+    let state = make_proxy_state(format!("http://{}", addr));
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state);
+
+    let payload = json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": true
+    });
+
+    let req = Request::builder()
+        .uri("/v1/chat/completions")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .contains("text/event-stream"));
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    // Raw OpenAI SSE relayed as-is — no Anthropic `event:` translation
+    assert!(text.contains("chat.completion.chunk"));
+    assert!(text.contains("[DONE]"));
+    assert!(!text.contains("content_block_delta"));
+}
+
+#[tokio::test]
+async fn test_chat_completions_invalid_json_returns_error() {
+    let upstream = spawn_mock_upstream().await;
+    let state = make_proxy_state(upstream);
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state);
+
+    let req = Request::builder()
+        .uri("/v1/chat/completions")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from("not json"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_chat_completions_rejects_anthropic_provider() {
+    let upstream = spawn_mock_upstream().await;
+    let config = ProxyConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        opencode_base_url: upstream,
+        opencode_api_key: None,
+        max_retries: 2,
+        warp_reset_delay_ms: 10,
+        hook_on_429: None,
+        provider: oplirex::providers::Provider::Anthropic,
+        extra_upstreams: vec![],
+        require_api_key: None,
+        fallback_models: vec![],
+        circuit_threshold: 5,
+        circuit_cooldown_secs: 60,
+    };
+    let client = reqwest::Client::builder().build().unwrap();
+    let warp_resolver = WarpResolver::new(2, 10);
+    let state = Arc::new(Mutex::new(ProxyState::new(config, client, warp_resolver)));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state);
+
+    let payload = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let req = Request::builder()
+        .uri("/v1/chat/completions")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 // Wiremock alternative smoke test (demonstrates mockito/wiremock usage)
@@ -346,4 +501,290 @@ async fn test_wiremock_models() {
     let body = axum::body::to_bytes(resp.into_body(), 1024*1024).await.unwrap();
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert!(v["data"].as_array().unwrap().iter().any(|m| m["id"]=="wiremock-model"));
+}
+
+// ---------- new-feature tests (failover, auth, circuit, rotation, usage, reload) ----------
+
+use axum::response::IntoResponse;
+use oplirex::metrics::METRICS;
+use oplirex::proxy::server::reload_handler;
+use std::time::{Duration, Instant};
+
+/// Upstream that 429s `primary-model` but serves everything else (with usage).
+async fn spawn_flaky_upstream() -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|body: axum::extract::Json<Value>| async move {
+            let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            if model == "primary-model" {
+                return StatusCode::TOO_MANY_REQUESTS.into_response();
+            }
+            Json(json!({
+                "id": "chatcmpl-flaky",
+                "object": "chat.completion",
+                "created": 0,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "served"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+            }))
+            .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+/// Upstream echoing a fixed tag as the completion content.
+async fn spawn_tagged_upstream(tag: &'static str) -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: axum::extract::Json<Value>| async move {
+            let model = body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            Json(json!({
+                "id": "chatcmpl-tagged",
+                "object": "chat.completion",
+                "created": 0,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": tag},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+fn chat_payload(model: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap()
+}
+
+fn messages_payload(model: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": model,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_fallback_model_serves_after_429() {
+    let upstream = spawn_flaky_upstream().await;
+    let state = make_proxy_state_with(upstream, |cfg| {
+        cfg.max_retries = 0; // exhaust the primary immediately, then fail over
+        cfg.fallback_models = vec!["fallback-model".to_string()];
+    });
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state);
+
+    let req = Request::builder()
+        .uri("/v1/chat/completions")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(chat_payload("primary-model")))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["model"], "fallback-model");
+    assert_eq!(v["choices"][0]["message"]["content"], "served");
+
+    let metrics = METRICS.to_json();
+    assert!(metrics["fallback_total"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn test_incoming_auth_enforced() {
+    let upstream = spawn_mock_upstream().await;
+    let state = make_proxy_state_with(upstream, |cfg| {
+        cfg.require_api_key = Some("topsecret".to_string());
+    });
+    let app = Router::new()
+        .route("/v1/messages", post(handle_messages))
+        .with_state(state);
+
+    // No key -> 401.
+    let req = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(messages_payload("m")))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Wrong key -> 401.
+    let req = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer wrong")
+        .body(Body::from(messages_payload("m")))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Correct Bearer key -> 200.
+    let req = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer topsecret")
+        .body(Body::from(messages_payload("m")))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Correct x-api-key (what Claude Code sends) -> 200.
+    let req = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("x-api-key", "topsecret")
+        .body(Body::from(messages_payload("m")))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_open_circuit_rejects_with_503() {
+    let upstream = spawn_mock_upstream().await;
+    let state = make_proxy_state(upstream);
+    {
+        let mut guard = state.lock().await;
+        guard.circuit_open_until = Some(Instant::now() + Duration::from_secs(60));
+    }
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state);
+
+    let req = Request::builder()
+        .uri("/v1/chat/completions")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(chat_payload("m")))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_expired_circuit_half_opens() {
+    let upstream = spawn_mock_upstream().await;
+    let state = make_proxy_state(upstream);
+    {
+        let mut guard = state.lock().await;
+        guard.circuit_open_until = Some(Instant::now() - Duration::from_secs(1));
+    }
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state);
+
+    let req = Request::builder()
+        .uri("/v1/chat/completions")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(chat_payload("m")))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_round_robin_across_upstreams() {
+    let first = spawn_tagged_upstream("tag-one").await;
+    let second = spawn_tagged_upstream("tag-two").await;
+    let state = make_proxy_state_with(first, |cfg| {
+        cfg.extra_upstreams = vec![second];
+    });
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state);
+
+    let mut tags = vec![];
+    for _ in 0..2 {
+        let req = Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(chat_payload("m")))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        tags.push(v["choices"][0]["message"]["content"].as_str().unwrap().to_string());
+    }
+    assert_eq!(tags, vec!["tag-one".to_string(), "tag-two".to_string()]);
+}
+
+#[tokio::test]
+async fn test_usage_and_history_recorded() {
+    let upstream = spawn_mock_upstream().await;
+    let state = make_proxy_state(upstream);
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state);
+
+    let req = Request::builder()
+        .uri("/v1/chat/completions")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(chat_payload("usage-probe-model")))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let metrics = METRICS.to_json();
+    assert_eq!(metrics["models_usage"]["usage-probe-model"]["prompt_tokens"], 5);
+    assert_eq!(metrics["models_usage"]["usage-probe-model"]["completion_tokens"], 3);
+    let history = metrics["request_history"].as_array().unwrap();
+    assert!(history.iter().any(|r| r["model"] == "usage-probe-model"
+        && r["endpoint"] == "openai"
+        && r["status"] == 200));
+}
+
+#[tokio::test]
+async fn test_reload_without_config_file_errors() {
+    // No config file registered in this test process -> 400, not a panic.
+    let upstream = spawn_mock_upstream().await;
+    let state = make_proxy_state(upstream);
+    let app = Router::new()
+        .route("/_oplire/reload", post(reload_handler))
+        .with_state(state);
+
+    let req = Request::builder()
+        .uri("/_oplire/reload")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
