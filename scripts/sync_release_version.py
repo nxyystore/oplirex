@@ -155,10 +155,25 @@ def set_choco_version(version: str) -> None:
             CHOCO_NUSPEC.write_text(new, encoding="utf-8")
     if CHOCO_PS1.exists():
         text = CHOCO_PS1.read_text(encoding="utf-8")
-        # Update version in URL if present
-        new = re.sub(r"/v[0-9.]+/", f"/v{version}/", text)
-        if new != text:
-            CHOCO_PS1.write_text(new, encoding="utf-8")
+        orig = text
+        # Update $version = 'x.y.z' (covers tools/chocolateyinstall.ps1)
+        text = re.sub(r"(?m)^\$version\s*=\s*'[^']+'", f"$version = '{version}'", text)
+        text = re.sub(r'(?m)^\$version\s*=\s*"[^"]+"', f'$version = "{version}"', text)
+        # Reset checksum placeholder (filled in CI post-build from SHA256SUMS)
+        text = re.sub(
+            r"(?m)^\$checksum64\s*=\s*'[^']+'",
+            "$checksum64 = 'REPLACEME_SHA256'",
+            text,
+        )
+        text = re.sub(
+            r'(?m)^\$checksum64\s*=\s*"[^"]+"',
+            '$checksum64 = "REPLACEME_SHA256"',
+            text,
+        )
+        # Also update hardcoded version in URL if present (nuspec/other ps1 variants)
+        text = re.sub(r"/v[0-9.]+/", f"/v{version}/", text)
+        if text != orig:
+            CHOCO_PS1.write_text(text, encoding="utf-8")
 
 
 def set_homebrew_version(version: str) -> None:
@@ -167,6 +182,16 @@ def set_homebrew_version(version: str) -> None:
     text = HOMEBREW.read_text(encoding="utf-8")
     text = re.sub(r'version "[^"]+"', f'version "{version}"', text, count=1)
     text = re.sub(r"/v[0-9.]+/", f"/v{version}/", text)
+    # reset to distinct placeholders (replaced in CI publish job from SHA256SUMS.txt)
+    # keep 4 distinct PLACEHOLDERs so CI can sed each arch separately
+    text = re.sub(r'sha256 "REPLACEME_[^"]+"', 'sha256 "REPLACEME"', text)
+    text = re.sub(r'sha256 "REPLACEME_SHA256"', 'sha256 "REPLACEME"', text)
+    c = text.count('sha256 "REPLACEME"')
+    if c == 4:
+        text = text.replace('sha256 "REPLACEME"', 'sha256 "REPLACEME_ARM64"', 1)
+        text = text.replace('sha256 "REPLACEME"', 'sha256 "REPLACEME_X86_64"', 1)
+        text = text.replace('sha256 "REPLACEME"', 'sha256 "REPLACEME_LINUX_ARM64"', 1)
+        text = text.replace('sha256 "REPLACEME"', 'sha256 "REPLACEME_LINUX_X86_64"', 1)
     HOMEBREW.write_text(text, encoding="utf-8")
 
 
