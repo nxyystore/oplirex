@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use oplire_reset::{ProxyConfig, AppConfig};
+use oplirex::{ProxyConfig, AppConfig};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-const VERSION: &str = "2.4.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser, Debug)]
 #[command(name = "oplire")]
@@ -838,7 +838,7 @@ fn main() {
             let proxy_handle = std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    oplire_reset::proxy::start_proxy_server(proxy_config).await
+                    oplirex::proxy::start_proxy_server(proxy_config).await
                 })
             });
 
@@ -896,7 +896,7 @@ fn main() {
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async {
-                oplire_reset::watch::start_watch_mode(
+                oplirex::watch::start_watch_mode(
                     &upstream_clone,
                     max_retries_clone,
                     warp_delay_clone,
@@ -936,7 +936,7 @@ fn main() {
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async {
-                oplire_reset::proxy::start_proxy_server(config).await
+                oplirex::proxy::start_proxy_server(config).await
             }) {
                 eprintln!("{} Daemon error: {}", "[ERROR]".red(), e);
                 std::process::exit(1);
@@ -1137,7 +1137,7 @@ fn main() {
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async {
-                oplire_reset::proxy::start_proxy_server(config).await
+                oplirex::proxy::start_proxy_server(config).await
             }) {
                 eprintln!("{} Proxy server error: {}", "[ERROR]".red(), e);
                 std::process::exit(1);

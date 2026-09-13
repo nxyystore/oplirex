@@ -1,0 +1,43 @@
+# Maintainer: nxyy <clubbed@duck.com>
+pkgname=oplirex
+pkgver=2.4.1
+pkgrel=1
+pkgdesc="OpenCode Ratelimit Reset via WARP tunnel + Anthropic Proxy Bridge"
+arch=('x86_64' 'aarch64')
+url="https://github.com/nxyystore/oplirex"
+license=('MIT')
+makedepends=('cargo')
+depends=('glibc' 'gcc-libs')
+optdepends=('cloudflare-warp-bin: for WARP tunnel rate limit reset functionality')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/nxyystore/oplirex/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo build --release --locked
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --locked || true
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "target/release/oplirex" "$pkgdir/usr/bin/oplirex"
+  ln -s oplirex "$pkgdir/usr/bin/oplire"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  # shell completions if binary supports it
+  if [ -x "$pkgdir/usr/bin/oplirex" ]; then
+    mkdir -p "$pkgdir/usr/share/bash-completion/completions" "$pkgdir/usr/share/zsh/site-functions" "$pkgdir/usr/share/fish/vendor_completions.d"
+    "$pkgdir/usr/bin/oplirex" completions bash 2>/dev/null > "$pkgdir/usr/share/bash-completion/completions/oplirex" || true
+    "$pkgdir/usr/bin/oplirex" completions zsh 2>/dev/null > "$pkgdir/usr/share/zsh/site-functions/_oplirex" || true
+    "$pkgdir/usr/bin/oplirex" completions fish 2>/dev/null > "$pkgdir/usr/share/fish/vendor_completions.d/oplirex.fish" || true
+  fi
+}

@@ -1,0 +1,64 @@
+name: Auto Tag on Release Commit
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  autotag:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse commit message for release/bump version
+        id: parse
+        shell: bash
+        run: |
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $MSG"
+          # Must start with release: or bump: (with optional scope) then vX.Y.Z
+          if echo "$MSG" | grep -qiE '^(release|bump)(\(.+\))?:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+'; then
+            VER=$(echo "$MSG" | grep -oiE 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?' | head -1 | tr -d 'vV')
+            echo "ver=$VER" >> "$GITHUB_OUTPUT"
+            echo "Found version: $VER"
+          else
+            echo "No release:/bump: prefix with version found — skipping"
+          fi
+
+      - name: Create tag and sync version
+        if: steps.parse.outputs.ver != ''
+        shell: bash
+        run: |
+          set -e
+          VER="${{ steps.parse.outputs.ver }}"
+          TAG="v$VER"
+          echo "Processing $TAG"
+
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists — skipping"
+            exit 0
+          fi
+
+          # Sync all packaging metadata from commit version
+          python3 scripts/sync_release_version.py "$VER"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m "chore: sync version $TAG [skip ci]"
+          fi
+
+          git tag "$TAG"
+          git push origin HEAD:main --follow-tags
+
+      - name: Summary
+        if: steps.parse.outputs.ver == ''
+        run: echo "No release:/bump: vX.Y.Z commit — no tag created."

@@ -1,0 +1,137 @@
+name: Publish Packages
+
+on:
+  release:
+    types: [published]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag e.g. v2.4.1"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  id-token: write  # for npm provenance, trusted publishing
+
+jobs:
+  crates:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'release' || github.event.release.prerelease == false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --locked --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, registry-url: 'https://registry.npmjs.org' }
+      - working-directory: platforms/npm
+        run: |
+          npm install --package-lock-only || true
+          npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  winget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update winget manifest hash
+        run: |
+          VER=${GITHUB_REF_NAME#v}
+          VER=${VER:-${{ github.event.inputs.version }}}
+          VER=${VER#v}
+          # fetch SHA from release SHA256SUMS if available
+          echo "Winget publish: version $VER"
+          # This workflow pushes to winget-pkgs via Releaser; hash is resolved there
+          echo "version=$VER" >> $GITHUB_OUTPUT
+        id: ver
+      - uses: vedantmgoyal2009/winget-releaser@main
+        with:
+          identifier: nxyy.oplirex
+          version: ${{ steps.ver.outputs.version }}
+          installers-regex: 'oplirex-windows.*\.(msi|exe)$'
+          token: ${{ secrets.WINGET_TOKEN }}
+
+  scoop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update scoop bucket
+        env:
+          GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: |
+          VER=${GITHUB_REF_NAME#v}; VER=${VER#v}
+          # if scoop-bucket repo exists, push updated json; otherwise skip
+          if gh repo view nxyystore/scoop-bucket >/dev/null 2>&1; then
+            gh repo clone nxyystore/scoop-bucket /tmp/scoop-bucket
+            # fetch hash from release
+            HASH=$(curl -fsSL "https://github.com/nxyystore/oplirex/releases/download/v$VER/SHA256SUMS.txt" 2>/dev/null | grep "windows.*zip" | awk '{print $1}' || echo "REPLACEME")
+            sed -i "s/\"hash\": \".*\"/\"hash\": \"$HASH\"/" platforms/scoop/oplirex.json
+            cp platforms/scoop/oplirex.json /tmp/scoop-bucket/bucket/oplirex.json
+            cd /tmp/scoop-bucket && git config user.name "github-actions[bot]" && git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add bucket/oplirex.json && git diff --cached --quiet || (git commit -m "oplirex v$VER" && git push)
+          else
+            echo "scoop-bucket repo not found — create nxyystore/scoop-bucket with bucket/oplirex.json first (see docs)"
+          fi
+
+  chocolatey:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Push to Chocolatey
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          if (-not $ver) { $ver = "${{ github.event.inputs.version }}".TrimStart('v') }
+          choco pack platforms/chocolatey/oplirex.nuspec --version $ver
+          choco push "oplirex.$ver.nupkg" --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+        shell: pwsh
+
+  aur:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish oplirex to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4
+        with:
+          pkgname: oplirex
+          pkgbuild: platforms/arch/PKGBUILD
+          commit_username: github-actions[bot]
+          commit_email: 41898282+github-actions[bot]@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          ssh_keyscan_types: rsa,ecdsa,ed25519
+      - name: Publish oplirex-bin to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4
+        with:
+          pkgname: oplirex-bin
+          pkgbuild: platforms/arch/PKGBUILD-bin
+          commit_username: github-actions[bot]
+          commit_email: 41898282+github-actions[bot]@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          ssh_keyscan_types: rsa,ecdsa,ed25519
+
+  homebrew:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VER=${GITHUB_REF_NAME#v}; VER=${VER#v}
+          if gh repo view nxyystore/homebrew-oplirex >/dev/null 2>&1; then
+            gh repo clone nxyystore/homebrew-oplirex /tmp/homebrew-oplirex
+            cp platforms/homebrew/oplirex.rb /tmp/homebrew-oplirex/Formula/oplirex.rb
+            cd /tmp/homebrew-oplirex && git config user.name "github-actions[bot]" && git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Formula/oplirex.rb && git diff --cached --quiet || (git commit -m "oplirex v$VER" && git push)
+          else
+            echo "homebrew-oplirex tap not found — create nxyystore/homebrew-oplirex first"
+          fi

@@ -1,15 +1,18 @@
 [package]
-name = "oplire-reset"
-version = "2.4.0"
+name = "oplirex"
+version = "2.4.1"
 edition = "2021"
-description = "OpenCode Limit Reset + Anthropic Proxy Bridge"
-authors = ["Berke Oruc"]
+description = "opencode.ai Limit Reset + Anthropic Proxy Bridge"
+authors = ["nxyy"]
 license = "MIT"
-repository = "https://github.com/berkeoruc/oplire"
-homepage = "https://github.com/berkeoruc/oplire"
+repository = "https://github.com/nxyystore/oplire"
+homepage = "https://github.com/nxyystore/oplire"
+readme = "README.md"
+keywords = ["opencode", "anthropic", "proxy", "warp", "rate-limit"]
+categories = ["command-line-utilities", "web-programming"]
 
 [[bin]]
-name = "oplire"
+name = "oplirex"
 path = "src/main.rs"
 
 [dependencies]

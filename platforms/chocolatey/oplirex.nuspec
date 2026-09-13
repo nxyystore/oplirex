@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>oplirex</id>
+    <version>2.4.1</version>
+    <title>oplirex</title>
+    <authors>nxyy</authors>
+    <projectUrl>https://github.com/nxyystore/oplirex</projectUrl>
+    <packageSourceUrl>https://github.com/nxyystore/oplirex</packageSourceUrl>
+    <licenseUrl>https://github.com/nxyystore/oplirex/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>OpenCode Limit Reset + Anthropic Proxy Bridge — reverse proxy for Claude Code with auto WARP rate-limit reset.</description>
+    <summary>opencode.ai limit reset and Anthropic proxy bridge</summary>
+    <tags>opencode anthropic warp proxy claude-code</tags>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

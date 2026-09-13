@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="oplirex" Manufacturer="nxyy" Version="2.4.1" UpgradeCode="a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6">
+    <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
+    <Media Id="1" Cabinet="oplirex.cab" EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="oplirex">
+        <Component Id="MainExecutable" Guid="b2c3d4e5-f6a7-48b9-c0d1-e2f3a4b5c6d7">
+          <File Id="OplirexExe" Source="oplirex.exe" KeyPath="yes" />
+          <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="ProductFeature" Title="oplirex" Level="1">
+      <ComponentRef Id="MainExecutable" />
+    </Feature>
+  </Package>
+</Wix>

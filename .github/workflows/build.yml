@@ -2,13 +2,21 @@ name: Build and Release
 
 on:
   push:
-    branches: [main]
-    tags: [v*]
+    tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to publish, e.g. v1.0.0"
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -19,48 +27,114 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary: oplire
-            ext: ''
-            os_name: linux
+            binary: oplirex
+            ext: ""
+            os_name: linux-x86_64
+            cross: false
           - os: windows-latest
-            target: x86_64-pc-windows-gnu
-            binary: oplire.exe
-            ext: '.exe'
-            os_name: windows
+            target: x86_64-pc-windows-msvc
+            binary: oplirex.exe
+            ext: ".exe"
+            os_name: windows-x86_64
+            cross: false
           - os: macos-latest
             target: x86_64-apple-darwin
-            binary: oplire
-            ext: ''
-            os_name: macos
+            binary: oplirex
+            ext: ""
+            os_name: macos-x86_64
+            cross: false
           - os: macos-latest
             target: aarch64-apple-darwin
-            binary: oplire
-            ext: ''
-            os_name: macos-arm
+            binary: oplirex
+            ext: ""
+            os_name: macos-arm64
+            cross: false
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Add target
-        run: rustup target add ${{ matrix.target }}
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package artifact (Unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
         run: |
           mkdir -p release
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} release/oplire-${{ matrix.os_name }}${{ matrix.ext }}
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "release/oplirex-${{ matrix.os_name }}${{ matrix.ext }}"
+          # Also create tar.gz for generic Linux/macOS installs
+          tar czf "release/oplirex-${{ matrix.os_name }}.tar.gz" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}"
+          sha256sum release/* > release/SHA256SUMS-${{ matrix.os_name }}.txt || shasum -a 256 release/* > release/SHA256SUMS-${{ matrix.os_name }}.txt
+          ls -lh release/
 
-      - name: Upload Release
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Package artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "release/oplirex-${{ matrix.os_name }}${{ matrix.ext }}"
+          # Zip for scoop/choco/npm generic
+          cd release && 7z a "oplirex-${{ matrix.os_name }}.zip" "oplirex-${{ matrix.os_name }}${{ matrix.ext }}" || powershell Compress-Archive -Path "oplirex-${{ matrix.os_name }}${{ matrix.ext }}" -DestinationPath "oplirex-${{ matrix.os_name }}.zip"
+          sha256sum * > SHA256SUMS-${{ matrix.os_name }}.txt || shasum -a 256 * > SHA256SUMS-${{ matrix.os_name }}.txt
+          ls -lh
+
+      - name: Build MSI (Windows only)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          # WiX MSI via cargo-wix (optional — skips if wix file missing)
+          if [ -f platforms/windows/oplire.wxs ]; then
+            cargo install cargo-wix --locked || true
+            cargo wix --nocapture --target ${{ matrix.target }} 2>&1 | tail -30 || echo "cargo wix not configured — skipping MSI"
+            find target -name "*.msi" -exec cp {} release/ \; 2>/dev/null || true
+          fi
+          ls -lh release/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: release/*
+          name: oplirex-${{ matrix.os_name }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: oplirex-*
+          merge-multiple: true
+
+      - name: Generate combined SHA256SUMS
+        shell: bash
+        run: |
+          cd release
+          cat SHA256SUMS-*.txt 2>/dev/null > SHA256SUMS.txt || sha256sum * > SHA256SUMS.txt || shasum -a 256 * > SHA256SUMS.txt
+          # Update winget/scoop/choco hashes placeholder is done post-release via publish workflows
+          cat SHA256SUMS.txt
+          find . -maxdepth 2 -type f | sort
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || github.event.inputs.version }}
+          name: ${{ github.ref_name || github.event.inputs.version }}
+          files: release/**/*
           draft: false
-          prerelease: ${{ contains(github.ref, 'beta') }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: ${{ contains(github.ref_name || github.event.inputs.version, 'beta') || contains(github.ref_name || github.event.inputs.version, 'rc') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
