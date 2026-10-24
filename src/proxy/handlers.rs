@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::config::ProxyConfig;
 use crate::proxy::server::build_client;
-use crate::transform::{anthropic_to_opencode_request, opencode_stream_to_anthropic, opencode_response_to_anthropic};
+use crate::transform::{anthropic_to_opencode_request, AnthropicStreamConverter, opencode_response_to_anthropic};
 use crate::warp::WarpResolver;
 
 pub struct ProxyState {
@@ -62,6 +62,27 @@ pub async fn handle_models(State(state): State<Arc<Mutex<ProxyState>>>) -> impl 
             warn!("Failed to fetch models from upstream: {}", e);
             (StatusCode::OK, Json(ProxyConfig::models_response()))
         }
+    }
+}
+
+pub async fn handle_readiness(State(state): State<Arc<Mutex<ProxyState>>>) -> StatusCode {
+    let state_guard = state.lock().await;
+    let models_url = format!(
+        "{}/v1/models",
+        state_guard.config.opencode_base_url.trim_end_matches('/')
+    );
+    let api_key = state_guard.config.opencode_api_key.clone();
+    let client = state_guard.client.clone();
+    drop(state_guard);
+
+    let mut request = client.get(models_url);
+    if let Some(key) = api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+
+    match request.send().await {
+        Ok(response) if response.status().is_success() => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -319,6 +340,7 @@ async fn forward_streaming(
     }
 
     let model_owned = model.to_string();
+    let converter = std::sync::Mutex::new(AnthropicStreamConverter::new(&model_owned));
     let stream = response
         .bytes_stream()
         .map(move |chunk| {
@@ -327,7 +349,8 @@ async fn forward_streaming(
             let mut output = String::new();
 
             for line in lines.lines() {
-                if let Some(transformed) = opencode_stream_to_anthropic(line, &model_owned) {
+                let mut guard = converter.lock().unwrap();
+                if let Some(transformed) = guard.convert(line) {
                     output.push_str(&transformed);
                 }
             }
@@ -439,4 +462,61 @@ fn error_response(message: &str) -> Response {
 enum ProxyError {
     RateLimited,
     RequestFailed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn readiness_for_upstream(status: &'static str) -> StatusCode {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        status
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let config = ProxyConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            opencode_base_url: format!("http://{}", address),
+            opencode_api_key: None,
+            inbound_api_key: None,
+            max_retries: 0,
+            warp_reset_delay_ms: 0,
+        };
+        let state = Arc::new(Mutex::new(ProxyState {
+            config,
+            client: Client::new(),
+            warp_resolver: WarpResolver::new(0, 0),
+        }));
+
+        let result = handle_readiness(State(state)).await;
+        upstream.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn readiness_succeeds_when_upstream_is_healthy() {
+        assert_eq!(readiness_for_upstream("200 OK").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_fails_when_upstream_is_unavailable() {
+        assert_eq!(
+            readiness_for_upstream("503 Service Unavailable").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }

@@ -1,14 +1,34 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use oplire_reset::{ProxyConfig, AppConfig};
+use oplirex::{ProxyConfig, AppConfig};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use tracing_subscriber::EnvFilter;
 
-const VERSION: &str = "2.4.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Initialize the global tracing subscriber so the `info!`/`warn!`/`error!`
+/// calls throughout the library actually emit output.
+///
+/// Output is suppressed unless the `RUST_LOG` environment variable is set
+/// (or `--verbose` is passed, which forces `oplirex=info`). This keeps the
+/// default CLI output clean while making diagnostics available on demand.
+fn init_tracing(verbose: bool) {
+    let filter = if verbose {
+        EnvFilter::new("oplirex=info")
+    } else {
+        EnvFilter::from_default_env().add_directive("oplirex=warn".parse().unwrap())
+    };
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
+}
 
 #[derive(Parser, Debug)]
-#[command(name = "oplire")]
+#[command(name = "oplirex")]
 #[command(version = VERSION)]
 #[command(about = "OpenCode Limit Reset + Anthropic Proxy Bridge", long_about = None)]
 struct Cli {
@@ -17,6 +37,9 @@ struct Cli {
 
     #[arg(long, global = true)]
     dry_run: bool,
+
+    #[arg(long, env = "OPLIREX_PROXY_API_KEY", global = true)]
+    proxy_api_key: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -98,6 +121,24 @@ enum InstallTarget {
 
 #[derive(Subcommand, Debug)]
 enum ConnectTarget {
+    Opencode {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        #[arg(long, default_value = "http://localhost:3000")]
+        upstream: String,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "3")]
+        max_retries: u32,
+        #[arg(long, default_value = "5000")]
+        warp_delay: u64,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        system_prompt: Option<String>,
+        #[arg(last = true)]
+        opencode_args: Vec<String>,
+    },
     ClaudeCode {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
@@ -122,8 +163,12 @@ enum ConnectTarget {
 enum ConfigAction {
     Show {},
     Set {
+        /// Setting to update: `listen`, `upstream`, `max_retries`, or `warp_delay`.
         #[arg(long)]
         key: Option<String>,
+        /// New value for the setting named by `--key`.
+        #[arg(long)]
+        value: Option<String>,
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
         #[arg(long, default_value = "http://localhost:3000")]
@@ -138,7 +183,7 @@ enum ConfigAction {
 
 fn config_path() -> PathBuf {
     let mut path = dirs_config_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push("oplire");
+    path.push("oplirex");
     path.push("config.json");
     path
 }
@@ -186,16 +231,225 @@ fn save_config(config: &AppConfig) -> Result<(), String> {
 }
 
 fn check_warp_installed() -> bool {
+    if is_windows() {
+        // On Windows WARP is a GUI app, not a `warp-cli` binary. Detect it by
+        // the presence of the installed executable in either Program Files.
+        let candidates = warp_executable_paths();
+        return candidates.iter().any(|p| Path::new(p).exists());
+    }
     Command::new("warp-cli").arg("--version").output().is_ok()
+}
+
+/// Return the candidate filesystem paths where the Windows WARP client may
+/// live, honoring the 32-bit Program Files (x86) location used by the
+/// Cloudflare installer.
+fn warp_executable_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+
+    if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+        paths.push(format!(r"{}\Cloudflare\Cloudflare WARP.exe", pf86));
+    }
+    if let Ok(pf64) = std::env::var("ProgramFiles") {
+        paths.push(format!(r"{}\Cloudflare\Cloudflare WARP.exe", pf64));
+    }
+
+    paths
+}
+
+fn is_windows() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// Wait until the local proxy's `/health` endpoint responds, polling every
+/// 100ms for up to `timeout_ms` milliseconds. Returns true on success.
+///
+/// This replaces the previous fixed 1.5s sleep, which could fail on slow
+/// machines or waste time on fast ones.
+fn wait_for_proxy_ready(listen_addr: &str, timeout_ms: u64) -> bool {
+    let url = format!("http://{}/health", listen_addr);
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_millis(100))
+        .timeout(std::time::Duration::from_millis(200))
+        .build();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let ok = match client.as_ref() {
+            Ok(c) => match c.get(&url).send() {
+                Ok(resp) => resp.status().is_success(),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+
+        if ok {
+            return true;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Install Cloudflare WARP on Windows by downloading the official installer
+/// and running it. Mirrors the logic of `scripts/install-windows.ps1`.
+fn install_warp_windows(dry_run: bool, verbose: bool) {
+    let installer_url =
+        "https://1111-releases.cloudflare.com/latest/Windows%20Cloudflare%20WARP%20Setup.exe";
+    let installer_path = std::env::temp_dir().join("Cloudflare-WARP-Setup.exe");
+    let installer_str = installer_path.display().to_string();
+
+    print_step(1, "Downloading Cloudflare WARP installer...");
+    if dry_run {
+        eprintln!(
+            "{} Would download {} to {}",
+            "[DRY-RUN]".cyan(),
+            installer_url,
+            installer_str
+        );
+        return;
+    }
+
+    if verbose {
+        eprintln!("{} Downloading {}...", "[DEBUG]".cyan(), installer_url);
+    }
+
+    match reqwest::blocking::get(installer_url) {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.bytes() {
+                Ok(bytes) => {
+                    if let Err(e) = std::fs::write(&installer_path, &bytes) {
+                        print_fail(&format!("Failed to save installer: {}", e));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    print_fail(&format!("Failed to read installer bytes: {}", e));
+                    return;
+                }
+            }
+        }
+        Ok(resp) => {
+            print_fail(&format!(
+                "Installer download returned HTTP {}",
+                resp.status()
+            ));
+            return;
+        }
+        Err(e) => {
+            print_fail(&format!("Failed to download installer: {}", e));
+            return;
+        }
+    }
+
+    print_step(2, "Running WARP installer (quiet)...");
+    let status = Command::new(&installer_path)
+        .args(["/quiet", "/install"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            let _ = std::fs::remove_file(&installer_path);
+        }
+        Ok(s) => {
+            print_fail(&format!("Installer exited with {}", s));
+            return;
+        }
+        Err(e) => {
+            print_fail(&format!("Failed to run installer: {}", e));
+            return;
+        }
+    }
+
+    if check_warp_installed() {
+        print_success("Cloudflare WARP installed");
+    } else {
+        print_fail("WARP installation may have failed. Check output above.");
+    }
+}
+
+/// Run a WARP CLI command. On Linux/macOS this is `warp-cli <args>`; on
+/// Windows there is no CLI, so we drive the GUI app directly (connect/disconnect
+/// are GUI-only actions; status is reported as best-effort).
+fn run_warp_cli(args: &[&str], dry_run: bool, verbose: bool) -> Result<String, String> {
+    if is_windows() {
+        let warp = warp_executable_paths()
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap_or_else(|| r"C:\Program Files (x86)\Cloudflare\Cloudflare WARP.exe".to_string());
+
+        let mut cmd_args: Vec<String> = Vec::new();
+        for arg in args {
+            match *arg {
+                "connect" => cmd_args.push("connect".to_string()),
+                "disconnect" => cmd_args.push("disconnect".to_string()),
+                "status" => {
+                    // The Windows app does not print machine-readable status;
+                    // report "Connected" only if the process is currently running.
+                    let running = Command::new("powershell")
+                        .args([
+                            "-NoProfile",
+                            "-Command",
+                            "(Get-Process 'Cloudflare WARP' -ErrorAction SilentlyContinue) -ne $null",
+                        ])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    return Ok(if running {
+                        "Connected".to_string()
+                    } else {
+                        "Disconnected".to_string()
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if cmd_args.is_empty() {
+            return Ok(String::new());
+        }
+
+        let arg_strs: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
+        run_command(&warp, &arg_strs, dry_run, verbose)
+    } else {
+        run_command("warp-cli", args, dry_run, verbose)
+    }
 }
 
 fn check_claude_installed() -> bool {
     Command::new("claude").arg("--version").output().is_ok()
 }
 
+fn check_node_installed() -> bool {
+    Command::new("node").arg("--version").output().is_ok()
+}
+
+fn opencode_command_candidates() -> Vec<&'static str> {
+    vec!["opencode", "opencode-ai"]
+}
+
+fn resolve_opencode_command() -> &'static str {
+    opencode_command_candidates()
+        .into_iter()
+        .find(|name| {
+            Command::new(*name)
+                .arg("--version")
+                .output()
+                .is_ok()
+                || Command::new(*name).arg("--help").output().is_ok()
+        })
+        .unwrap_or("opencode")
+}
+
 fn check_opencode_installed() -> bool {
-    Command::new("opencode").arg("--version").output().is_ok()
-        || Command::new("opencode").arg("--help").output().is_ok()
+    opencode_command_candidates()
+        .into_iter()
+        .any(|name| {
+            Command::new(name).arg("--version").output().is_ok()
+                || Command::new(name).arg("--help").output().is_ok()
+        })
 }
 
 fn check_opencode_running(base_url: &str) -> bool {
@@ -208,8 +462,68 @@ fn check_opencode_running(base_url: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn check_node_installed() -> bool {
-    Command::new("node").arg("--version").output().is_ok()
+/// Run `npm` with the given args. If npm is not directly on PATH, fall back to
+/// a shell that sources nvm (used after auto-installing Node.js via nvm).
+fn run_npm_install(dry_run: bool, verbose: bool, args: &[&str]) -> Result<(), String> {
+    if Command::new("npm").arg("--version").output().is_ok() {
+        return run_interactive("npm", args, dry_run, verbose);
+    }
+
+    let joined = args
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cmd = format!(
+        "export NVM_DIR=\"$HOME/.nvm\"; \
+         [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; \
+         nvm use --lts >/dev/null 2>&1; \
+         npm {}",
+        joined
+    );
+    run_interactive("sh", &["-c", &cmd], dry_run, verbose)
+}
+
+/// Attempt to install Node.js via nvm (download latest nvm, install latest LTS).
+/// Returns true if a usable `node` binary is available afterwards.
+fn ensure_node_installed(dry_run: bool, verbose: bool) -> bool {
+    if check_node_installed() {
+        return true;
+    }
+
+    println!();
+    println!("{} Node.js not found — installing via nvm...", "→".cyan());
+
+    let nvm_install_script = "https://raw.githubusercontent.com/nvm-sh/nvm/master/install.sh";
+
+    if run_command("curl", &["-fsSL", nvm_install_script, "-o", "/tmp/nvm-install.sh"], dry_run, verbose).is_err() {
+        println!("{} Failed to download nvm install script", "[ERROR]".red());
+        println!("{} Install Node.js manually: https://nodejs.org/", "Fix:".cyan());
+        return false;
+    }
+
+    if run_interactive("sh", &["/tmp/nvm-install.sh"], dry_run, verbose).is_err() {
+        println!("{} Failed to run nvm install script", "[ERROR]".red());
+        println!("{} Install Node.js manually: https://nodejs.org/", "Fix:".cyan());
+        return false;
+    }
+
+    println!("{} nvm installed, installing latest LTS...", "→".cyan());
+
+    // Source nvm in a fresh shell and install latest LTS.
+    let install_cmd = "export NVM_DIR=\"$HOME/.nvm\"; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; nvm install --lts";
+    if run_interactive("sh", &["-c", install_cmd], dry_run, verbose).is_err() {
+        println!("{} Failed to install Node.js via nvm", "[ERROR]".red());
+        println!("{} Install Node.js manually: https://nodejs.org/", "Fix:".cyan());
+        return false;
+    }
+
+    println!();
+    println!("{}", "Node.js installed via nvm!".green().bold());
+    println!("{} Restart your terminal to use `node`/`npm` directly", "Tip:".cyan());
+    println!();
+
+    check_node_installed()
 }
 
 fn run_command(cmd: &str, args: &[&str], dry_run: bool, verbose: bool) -> Result<String, String> {
@@ -280,7 +594,25 @@ fn run_sudo_command(cmd: &str, dry_run: bool, verbose: bool) -> Result<String, S
     }
 }
 
-fn run_interactive(cmd: &str, args: &[&str]) -> Result<(), String> {
+fn run_interactive(cmd: &str, args: &[&str], dry_run: bool, verbose: bool) -> Result<(), String> {
+    if dry_run {
+        if verbose {
+            eprintln!(
+                "{} Would execute (interactive): {} {}",
+                "[DRY-RUN]".cyan(),
+                cmd,
+                args.join(" ")
+            );
+        } else {
+            eprintln!("{} {} {}", "[DRY-RUN]".cyan(), cmd, args.join(" "));
+        }
+        return Ok(());
+    }
+
+    if verbose {
+        eprintln!("{} Running: {} {}", "[DEBUG]".cyan(), cmd, args.join(" "));
+    }
+
     let status = Command::new(cmd)
         .args(args)
         .status()
@@ -408,6 +740,8 @@ fn print_info_formatted(label: &str, desc: &str) {
 fn main() {
     let cli = Cli::parse();
 
+    init_tracing(cli.verbose);
+
     if cli.verbose {
         eprintln!("{} Verbose mode enabled", "[DEBUG]".yellow());
     }
@@ -475,13 +809,13 @@ fn main() {
 
                                 println!();
                                 println!("{}", "Usage:".bold());
-                                println!("  {}", "oplire connect claude-code --model <id>".bold().yellow());
+                                println!("  {}", "oplirex connect claude-code --model <id>".bold().yellow());
                                 println!();
                                 println!("{}", "Examples:".bold());
                                 for m in models.iter().take(3) {
                                     let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                     if !id.is_empty() {
-                                        println!("  {}", format!("oplire connect claude-code --model {}", id).dimmed());
+                                        println!("  {}", format!("oplirex connect claude-code --model {}", id).dimmed());
                                     }
                                 }
                             } else {
@@ -507,7 +841,7 @@ fn main() {
 
         Commands::Setup {} => {
             print_banner();
-            println!("{}", "Welcome to oplire Setup Wizard".bold().green());
+            println!("{}", "Welcome to oplireX Setup Wizard".bold().green());
             println!();
             println!("{}", "This will check and install all required components.".dimmed());
             println!();
@@ -518,20 +852,20 @@ fn main() {
                 steps_needed.push(("Node.js", "npm install -g npm", "Required for Claude Code and OpenCode"));
             }
             if !warp_installed {
-                steps_needed.push(("Cloudflare WARP", "oplire install warp", "Required for rate limit reset"));
+                steps_needed.push(("Cloudflare WARP", "oplirex install warp", "Required for rate limit reset"));
             }
             if !check_opencode_installed() {
-                steps_needed.push(("OpenCode", "oplire install opencode", "AI coding assistant backend"));
+                steps_needed.push(("OpenCode", "oplirex install opencode", "AI coding assistant backend"));
             }
             if !check_claude_installed() {
-                steps_needed.push(("Claude Code", "oplire install claudecode", "AI coding assistant CLI"));
+                steps_needed.push(("Claude Code", "oplirex install claudecode", "AI coding assistant CLI"));
             }
 
             if steps_needed.is_empty() {
                 println!("{}", "Everything is already installed!".green().bold());
                 println!();
                 println!("{} Run to get started:", "Tip:".cyan().bold());
-                println!("  {}", "oplire connect claude-code".bold().yellow());
+                println!("  {}", "oplirex connect claude-code".bold().yellow());
                 return;
             }
 
@@ -548,18 +882,19 @@ fn main() {
 
                 match *name {
                     "Node.js" => {
-                        println!("  {} Node.js must be installed manually", "ℹ".yellow());
-                        println!("  {}", "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash".dimmed());
-                        println!("  {}", "Then restart your terminal".dimmed());
+                        if !ensure_node_installed(cli.dry_run, cli.verbose) {
+                            print_fail("Node.js installation failed");
+                            println!("{} Install manually: https://nodejs.org/", "Fix:".cyan());
+                        }
                     }
                     "Cloudflare WARP" => {
-                        let _ = run_interactive("oplire", &["install", "warp"]);
+                        let _ = run_interactive("oplirex", &["install", "warp"], cli.dry_run, cli.verbose);
                     }
                     "OpenCode" => {
-                        let _ = run_interactive("oplire", &["install", "opencode"]);
+                        let _ = run_interactive("oplirex", &["install", "opencode"], cli.dry_run, cli.verbose);
                     }
                     "Claude Code" => {
-                        let _ = run_interactive("oplire", &["install", "claude-code"]);
+                        let _ = run_interactive("oplirex", &["install", "claude-code"], cli.dry_run, cli.verbose);
                     }
                     _ => {}
                 }
@@ -567,10 +902,10 @@ fn main() {
 
             println!();
             println!("{}", "Setup complete!".green().bold());
-                println!();
-                println!("{}", "Next steps:".bold());
-                println!("  1. {}", "oplire doctor".bold().yellow());
-                println!("  2. {}", "oplire connect claude-code".bold().yellow());
+            println!();
+            println!("{}", "Next steps:".bold());
+            println!("  1. {}", "oplirex doctor".bold().yellow());
+            println!("  2. {}", "oplirex connect claude-code".bold().yellow());
         }
 
         Commands::Install { target } => match target {
@@ -581,16 +916,18 @@ fn main() {
 
                 if warp_installed {
                     println!("{} WARP is already installed", "[INFO]".green());
-                    println!("{} Run `oplire reset` to refresh your IP", "Tip:".cyan());
+                    println!("{} Run `oplirex reset` to refresh your IP", "Tip:".cyan());
                     return;
                 }
 
-                if let Ok(output) = Command::new("sh").arg("-c").arg("cat /etc/os-release").output() {
+                if is_windows() {
+                    install_warp_windows(cli.dry_run, cli.verbose);
+                } else if let Ok(output) = Command::new("sh").arg("-c").arg("cat /etc/os-release").output() {
                     let os_release = String::from_utf8_lossy(&output.stdout);
 
                     if os_release.contains("arch") || os_release.contains("manjaro") {
                         print_step(1, "Installing cloudflare-warp-bin via yay...");
-                        match run_interactive("yay", &["-S", "--noconfirm", "cloudflare-warp-bin"]) {
+                        match run_interactive("yay", &["-S", "--noconfirm", "cloudflare-warp-bin"], cli.dry_run, cli.verbose) {
                             Ok(()) => print_success("WARP installed"),
                             Err(e) => print_fail(&format!("Installation failed: {}", e)),
                         }
@@ -600,7 +937,7 @@ fn main() {
                     {
                         print_step(1, "Adding Cloudflare repository...");
 
-                        // Remove the legacy repository file created by older oplire versions.
+                        // Remove the legacy repository file created by older oplirex versions.
                         let _ = run_sudo_command(
                             "rm -f /etc/apt/sources.list.d/cloudflare-warp.list",
                             cli.dry_run,
@@ -645,9 +982,13 @@ fn main() {
                 if check_warp_installed() {
                     println!();
                     println!("{}", "Next steps:".bold());
-                    println!("  1. {}", "warp-cli connect".bold().yellow());
-                    println!("  2. {}", "warp-cli status".bold().yellow());
-                    println!("  3. {}", "oplire reset".bold().yellow());
+                    if is_windows() {
+                        println!("  1. {}", "Open the Cloudflare WARP tray app and connect".bold().yellow());
+                    } else {
+                        println!("  1. {}", "warp-cli connect".bold().yellow());
+                        println!("  2. {}", "warp-cli status".bold().yellow());
+                    }
+                    println!("  3. {}", "oplirex reset".bold().yellow());
                 } else {
                     println!();
                     print_fail("WARP installation may have failed. Check output above.");
@@ -664,28 +1005,27 @@ fn main() {
                     return;
                 }
 
-                if !check_node_installed() {
-                    println!("{} Node.js is required but not found", "[ERROR]".red());
-                    println!("{} Install Node.js first: https://nodejs.org/", "Fix:".cyan());
+                if !ensure_node_installed(cli.dry_run, cli.verbose) {
                     std::process::exit(1);
                 }
 
-                print_step(1, "Installing OpenCode via npm...");
-                match run_interactive("npm", &["install", "-g", "opencode-ai"]) {
-                    Ok(()) => {
-                        print_success("OpenCode installed");
-                        println!();
-                        println!("{}", "Next steps:".bold());
-                        println!("  1. {}", "opencode".bold().yellow());
-                        println!("  2. {}", "oplire doctor".bold().yellow());
-                        println!("  3. {}", "oplire connect claude-code".bold().yellow());
-                    }
-                    Err(e) => {
-                        print_fail(&format!("Installation failed: {}", e));
-                        println!();
-                        println!("{} Try manually:", "Fix:".cyan());
-                        println!("  {}", "npm install -g opencode-ai".bold().yellow());
-                    }
+                print_step(1, "Installing OpenCode CLI (v2, with v1 fallback)...");
+                let install_ok = run_npm_install(cli.dry_run, cli.verbose, &["install", "-g", "@opencode/cli"]).is_ok()
+                    || run_npm_install(cli.dry_run, cli.verbose, &["install", "-g", "opencode-ai"]).is_ok();
+
+                if install_ok {
+                    print_success("OpenCode installed");
+                    println!();
+                    println!("{}", "Next steps:".bold());
+                    println!("  1. {}", "opencode --version".bold().yellow());
+                    println!("  2. {}", "oplirex doctor".bold().yellow());
+                    println!("  3. {}", "oplirex connect opencode".bold().yellow());
+                } else {
+                    print_fail("OpenCode installation failed");
+                    println!();
+                    println!("{} Try manually:", "Fix:".cyan());
+                    println!("  {}", "npm install -g @opencode/cli".bold().yellow());
+                    println!("  {}", "npm install -g opencode-ai".bold().yellow());
                 }
             }
 
@@ -702,20 +1042,18 @@ fn main() {
                     return;
                 }
 
-                if !check_node_installed() {
-                    println!("{} Node.js is required but not found", "[ERROR]".red());
-                    println!("{} Install Node.js first: https://nodejs.org/", "Fix:".cyan());
+                if !ensure_node_installed(cli.dry_run, cli.verbose) {
                     std::process::exit(1);
                 }
 
                 print_step(1, "Installing Claude Code via npm...");
-                match run_interactive("npm", &["install", "-g", "@anthropic-ai/claude-code"]) {
+                match run_npm_install(cli.dry_run, cli.verbose, &["install", "-g", "@anthropic-ai/claude-code"]) {
                     Ok(()) => {
                         print_success("Claude Code installed");
                         println!();
                         println!("{}", "Next steps:".bold());
                         println!("  1. {}", "claude --version".bold().yellow());
-                        println!("  2. {}", "oplire connect claude-code".bold().yellow());
+                        println!("  2. {}", "oplirex connect claude-code".bold().yellow());
                     }
                     Err(e) => {
                         print_fail(&format!("Installation failed: {}", e));
@@ -735,33 +1073,33 @@ fn main() {
                 if check_warp_installed() {
                     print_success("WARP already installed");
                 } else {
-                    let _ = run_interactive("oplire", &["install", "warp"]);
+                    let _ = run_interactive("oplirex", &["install", "warp"], cli.dry_run, cli.verbose);
                 }
 
                 print_step(2, "Checking OpenCode...");
                 if check_opencode_installed() {
                     print_success("OpenCode already installed");
                 } else {
-                    let _ = run_interactive("oplire", &["install", "opencode"]);
+                    let _ = run_interactive("oplirex", &["install", "opencode"], cli.dry_run, cli.verbose);
                 }
 
                 print_step(3, "Checking Claude Code...");
                 if check_claude_installed() {
                     print_success("Claude Code already installed");
                 } else {
-                    let _ = run_interactive("oplire", &["install", "claude-code"]);
+                    let _ = run_interactive("oplirex", &["install", "claude-code"], cli.dry_run, cli.verbose);
                 }
 
                 println!();
                 println!("{}", "All components installed!".green().bold());
                 println!();
                 println!("{}", "Run to get started:".bold());
-                println!("  {}", "oplire connect claude-code".bold().yellow());
+                println!("  {}", "oplirex connect claude-code".bold().yellow());
             }
         },
 
-        Commands::Connect {
-            target: ConnectTarget::ClaudeCode {
+        Commands::Connect { target } => match target {
+            ConnectTarget::Opencode {
                 listen,
                 upstream,
                 api_key,
@@ -769,22 +1107,19 @@ fn main() {
                 warp_delay,
                 model,
                 system_prompt,
-                claude_args,
-            },
-        } => {
-            print_banner();
-            println!("{}", "Claude Code Bridge".bold().green());
-            println!();
+                opencode_args,
+            } => {
+                print_banner();
+                println!("{}", "OpenCode v2 CLI Bridge".bold().green());
+                println!();
 
-            if !check_claude_installed() {
-                eprintln!("{} Claude Code not found in PATH", "[ERROR]".red());
-                eprintln!("{} Install: {}", "Fix:".cyan(), "oplire install claude-code".bold().yellow());
-                std::process::exit(1);
-            }
+                if !check_opencode_installed() {
+                    eprintln!("{} OpenCode CLI not found in PATH", "[ERROR]".red());
+                    eprintln!("{} Install: {} or {}", "Fix:".cyan(), "npm install -g @opencode/cli (v2)".bold().yellow(), "npm install -g opencode-ai (v1)".bold().yellow());
+                    std::process::exit(1);
+                }
 
-            let selected_model = match model {
-                Some(m) => m.clone(),
-                None => {
+                let selected_model = model.clone().unwrap_or_else(|| {
                     println!("{} Fetching models from {}...", "→".cyan(), upstream.bold());
                     match fetch_models(upstream) {
                         Ok(models) => {
@@ -807,49 +1142,180 @@ fn main() {
                             String::new()
                         }
                     }
+                });
+
+                let config = ProxyConfig {
+                    listen_addr: listen.clone(),
+                    opencode_base_url: upstream.clone(),
+                    opencode_api_key: api_key.clone(),
+                    inbound_api_key: cli.proxy_api_key.clone(),
+                    max_retries: *max_retries,
+                    warp_reset_delay_ms: *warp_delay,
+                };
+
+                println!("{} Proxy:      {}", "→".green(), listen.bold());
+                println!("{} Upstream:   {}", "→".green(), upstream.bold());
+                println!("{} Auto-reset: {} (attempts: {})", "→".green(), "enabled".green().bold(), max_retries.to_string().bold());
+                if !selected_model.is_empty() {
+                    println!("{} Model:     {}", "→".green(), selected_model.bold());
                 }
-            };
+                if let Some(sp) = system_prompt {
+                    println!("{} System:    {} chars", "→".green(), sp.len().to_string().bold());
+                }
+                println!();
 
-            let config = ProxyConfig {
-                listen_addr: listen.clone(),
-                opencode_base_url: upstream.clone(),
-                opencode_api_key: api_key.clone(),
-                max_retries: *max_retries,
-                warp_reset_delay_ms: *warp_delay,
-            };
+                println!("{}", "Starting proxy server...".dimmed());
 
-            println!("{} Proxy:      {}", "→".green(), listen.bold());
-            println!("{} Upstream:   {}", "→".green(), upstream.bold());
-            println!("{} Auto-reset: {} (attempts: {})", "→".green(), "enabled".green().bold(), max_retries.to_string().bold());
-            if !selected_model.is_empty() {
-                println!("{} Model:     {}", "→".green(), selected_model.bold());
+                let proxy_config = config.clone();
+                let listen_clone = listen.clone();
+                let model_clone = selected_model.clone();
+
+                let proxy_handle = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        oplirex::proxy::start_proxy_server(proxy_config).await
+                    })
+                });
+
+                if !wait_for_proxy_ready(&listen, 5000) {
+                    eprintln!("{} Proxy did not become ready in time", "[ERROR]".red());
+                    std::process::exit(1);
+                }
+
+                println!("{}", "Launching OpenCode CLI...".dimmed());
+                println!();
+
+                let binary = resolve_opencode_command();
+                let mut cmd = Command::new(binary);
+                let proxy_key = cli.proxy_api_key.clone().unwrap_or_else(|| "oplirex-proxy-key".to_string());
+                cmd.env("ANTHROPIC_BASE_URL", format!("http://{}", listen_clone))
+                    .env("ANTHROPIC_API_KEY", &proxy_key)
+                    .env("OPENAI_BASE_URL", format!("http://{}", listen_clone))
+                    .env("OPENAI_API_KEY", &proxy_key)
+                    .env("OPENCODE_BASE_URL", format!("http://{}", listen_clone))
+                    .env("OPENCODE_API_KEY", &proxy_key);
+
+                if !model_clone.is_empty() {
+                    cmd.env("ANTHROPIC_MODEL", &model_clone)
+                        .env("OPENAI_MODEL", &model_clone)
+                        .env("OPENCODE_MODEL", &model_clone);
+                }
+
+                if let Some(sp) = system_prompt {
+                    cmd.env("CLAUDE_CODE_SYSTEM_PROMPT", sp)
+                        .env("OPENCODE_SYSTEM_PROMPT", sp);
+                }
+
+                if !opencode_args.is_empty() {
+                    cmd.args(opencode_args);
+                }
+
+                let status = cmd.status().map_err(|e| e.to_string()).unwrap_or_else(|_| {
+                    eprintln!("{} Failed to launch OpenCode CLI", "[ERROR]".red());
+                    std::process::exit(1);
+                });
+
+                println!();
+                println!("{} OpenCode CLI exited with: {}", "Info:".cyan(), status.to_string().bold());
+                println!("{} Shutting down proxy...", "→".green().dimmed());
+
+                drop(proxy_handle);
             }
-            if let Some(sp) = system_prompt {
-                println!("{} System:    {} chars", "→".green(), sp.len().to_string().bold());
-            }
-            println!();
+            ConnectTarget::ClaudeCode {
+                listen,
+                upstream,
+                api_key,
+                max_retries,
+                warp_delay,
+                model,
+                system_prompt,
+                claude_args,
+            } => {
+                print_banner();
+                println!("{}", "Claude Code Bridge".bold().green());
+                println!();
 
-            println!("{}", "Starting proxy server...".dimmed());
+                if !check_claude_installed() {
+                    eprintln!("{} Claude Code not found in PATH", "[ERROR]".red());
+                    eprintln!("{} Install: {}", "Fix:".cyan(), "oplirex install claude-code".bold().yellow());
+                    std::process::exit(1);
+                }
 
-            let proxy_config = config.clone();
-            let listen_clone = listen.clone();
-            let model_clone = selected_model.clone();
+                let selected_model = match model {
+                    Some(m) => m.clone(),
+                    None => {
+                        println!("{} Fetching models from {}...", "→".cyan(), upstream.bold());
+                        match fetch_models(upstream) {
+                            Ok(models) => {
+                                if models.is_empty() {
+                                    println!("{} No models found, using default", "[WARN]".yellow());
+                                    String::new()
+                                } else {
+                                    match select_model_interactively(&models) {
+                                        Some(id) => id,
+                                        None => {
+                                            println!("{} No selection made, using default", "[WARN]".yellow());
+                                            String::new()
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("{} Failed to fetch models: {}", "[WARN]".yellow(), e);
+                                println!("{} Starting without model selection", "Tip:".cyan());
+                                String::new()
+                            }
+                        }
+                    }
+                };
 
-            let proxy_handle = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    oplire_reset::proxy::start_proxy_server(proxy_config).await
-                })
-            });
+                let config = ProxyConfig {
+                    listen_addr: listen.clone(),
+                    opencode_base_url: upstream.clone(),
+                    opencode_api_key: api_key.clone(),
+                    inbound_api_key: cli.proxy_api_key.clone(),
+                    max_retries: *max_retries,
+                    warp_reset_delay_ms: *warp_delay,
+                };
 
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+                println!("{} Proxy:      {}", "→".green(), listen.bold());
+                println!("{} Upstream:   {}", "→".green(), upstream.bold());
+                println!("{} Auto-reset: {} (attempts: {})", "→".green(), "enabled".green().bold(), max_retries.to_string().bold());
+                if !selected_model.is_empty() {
+                    println!("{} Model:     {}", "→".green(), selected_model.bold());
+                }
+                if let Some(sp) = system_prompt {
+                    println!("{} System:    {} chars", "→".green(), sp.len().to_string().bold());
+                }
+                println!();
 
-            println!("{}", "Launching Claude Code...".dimmed());
-            println!();
+                println!("{}", "Starting proxy server...".dimmed());
+
+                let proxy_config = config.clone();
+                let listen_clone = listen.clone();
+                let model_clone = selected_model.clone();
+
+                let proxy_handle = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        oplirex::proxy::start_proxy_server(proxy_config).await
+                    })
+                });
+
+                if !wait_for_proxy_ready(&listen, 5000) {
+                    eprintln!("{} Proxy did not become ready in time", "[ERROR]".red());
+                    std::process::exit(1);
+                }
+
+                println!("{}", "Launching Claude Code...".dimmed());
+                println!();
 
             let mut cmd = Command::new("claude");
             cmd.env("ANTHROPIC_BASE_URL", format!("http://{}", listen_clone))
-                .env("ANTHROPIC_API_KEY", "oplire-proxy-key");
+                .env(
+                    "ANTHROPIC_API_KEY",
+                    cli.proxy_api_key.as_deref().unwrap_or("oplirex-proxy-key"),
+                );
 
             if !model_clone.is_empty() {
                 cmd.env("ANTHROPIC_MODEL", &model_clone);
@@ -874,8 +1340,9 @@ fn main() {
 
             drop(proxy_handle);
         }
+    },
 
-        Commands::Watch {
+    Commands::Watch {
             upstream,
             max_retries,
             warp_delay,
@@ -896,7 +1363,7 @@ fn main() {
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async {
-                oplire_reset::watch::start_watch_mode(
+                oplirex::watch::start_watch_mode(
                     &upstream_clone,
                     max_retries_clone,
                     warp_delay_clone,
@@ -930,13 +1397,14 @@ fn main() {
                 listen_addr: listen.clone(),
                 opencode_base_url: upstream.clone(),
                 opencode_api_key: api_key.clone(),
+                inbound_api_key: cli.proxy_api_key.clone(),
                 max_retries: *max_retries,
                 warp_reset_delay_ms: *warp_delay,
             };
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async {
-                oplire_reset::proxy::start_proxy_server(config).await
+                oplirex::proxy::start_proxy_server(config).await
             }) {
                 eprintln!("{} Daemon error: {}", "[ERROR]".red(), e);
                 std::process::exit(1);
@@ -952,9 +1420,11 @@ fn main() {
             let mut checks = Vec::new();
 
             if warp_installed {
-                checks.push(("WARP CLI", "installed".to_string(), true));
+                let label = if is_windows() { "WARP" } else { "WARP CLI" };
+                checks.push((label, "installed".to_string(), true));
             } else {
-                checks.push(("WARP CLI", "NOT FOUND".to_string(), false));
+                let label = if is_windows() { "WARP" } else { "WARP CLI" };
+                checks.push((label, "NOT FOUND".to_string(), false));
                 all_ok = false;
             }
 
@@ -1013,14 +1483,14 @@ fn main() {
             } else {
                 println!("{}", "Some checks failed.".yellow().bold());
                 println!();
-                println!("{} Run `oplire setup` for guided installation", "Fix:".cyan());
+                println!("{} Run `oplirex setup` for guided installation", "Fix:".cyan());
             }
         }
 
         Commands::QuickReset {} => {
             if !warp_installed {
                 println!("{} WARP is not installed", "[ERROR]".red());
-                println!("{} Run `oplire install warp` first", "Tip:".cyan().bold());
+                println!("{} Run `oplirex install warp` first", "Tip:".cyan().bold());
                 return;
             }
 
@@ -1029,13 +1499,12 @@ fn main() {
             if cli.verbose {
                 eprintln!("{} Disconnecting...", "[DEBUG]".cyan());
             }
-            let _ = run_command("warp-cli", &["disconnect"], cli.dry_run, cli.verbose);
+            let _ = run_warp_cli(&["disconnect"], cli.dry_run, cli.verbose);
 
             if cli.verbose {
                 eprintln!("{} Registration new...", "[DEBUG]".cyan());
             }
-            let _ = run_command(
-                "warp-cli",
+            let _ = run_warp_cli(
                 &["registration", "new"],
                 cli.dry_run,
                 cli.verbose,
@@ -1044,7 +1513,7 @@ fn main() {
             if cli.verbose {
                 eprintln!("{} Connecting...", "[DEBUG]".cyan());
             }
-            let _ = run_command("warp-cli", &["connect"], cli.dry_run, cli.verbose);
+            let _ = run_warp_cli(&["connect"], cli.dry_run, cli.verbose);
 
             println!("{}", "Quick reset complete!".green().bold());
         }
@@ -1061,13 +1530,40 @@ fn main() {
                 println!("{} {}", "Config file:".bold(), config_path().display());
             }
             ConfigAction::Set {
-                key: _,
+                key,
+                value,
                 listen,
                 upstream,
                 max_retries,
                 warp_delay,
             } => {
                 let mut config = load_config();
+
+                // Apply the key/value pair first (if given), then the explicit
+                // field overrides. This lets users do either:
+                //   oplirex config set --key listen --value 0.0.0.0:9000
+                //   oplirex config set --listen 0.0.0.0:9000
+                if let Some(k) = key.as_deref() {
+                    let v = value.as_deref().unwrap_or("");
+                    match k {
+                        "listen" => config.listen = v.to_string(),
+                        "upstream" => config.upstream = v.to_string(),
+                        "max_retries" => {
+                            config.max_retries = v.parse::<u32>().unwrap_or(config.max_retries);
+                        }
+                        "warp_delay" => {
+                            config.warp_delay = v.parse::<u64>().unwrap_or(config.warp_delay);
+                        }
+                        other => {
+                            eprintln!(
+                                "{} Unknown config key: {}. Valid: listen, upstream, max_retries, warp_delay",
+                                "[ERROR]".red(),
+                                other
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
 
                 config.listen = listen.clone();
                 config.upstream = upstream.clone();
@@ -1112,6 +1608,7 @@ fn main() {
                 listen_addr: listen.clone(),
                 opencode_base_url: upstream.clone(),
                 opencode_api_key: api_key.clone(),
+                inbound_api_key: cli.proxy_api_key.clone(),
                 max_retries: *max_retries,
                 warp_reset_delay_ms: *warp_delay,
             };
@@ -1132,12 +1629,12 @@ fn main() {
                 "Tip:".cyan().bold(),
                 format!("http://{}", listen).yellow().bold()
             );
-            println!("{} Or run: {}", "→".cyan(), "oplire connect claude-code".bold());
+            println!("{} Or run: {}", "→".cyan(), "oplirex connect claude-code".bold());
             println!();
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async {
-                oplire_reset::proxy::start_proxy_server(config).await
+                oplirex::proxy::start_proxy_server(config).await
             }) {
                 eprintln!("{} Proxy server error: {}", "[ERROR]".red(), e);
                 std::process::exit(1);
@@ -1147,12 +1644,12 @@ fn main() {
         Commands::Status { json } => {
             if !warp_installed {
                 if *json {
-                    println!("{{\"connected\": false, \"tunnel_id\": null, \"error\": \"warp-cli not installed\"}}");
+                    println!("{{\"connected\": false, \"tunnel_id\": null, \"error\": \"WARP not installed\"}}");
                 } else {
                     println!("{} {}", "Tunnel:".bold(), "Not connected".red());
                     println!("{} {}", "WARP:".bold(), "Not installed".red());
                     println!(
-                        "\n{} Run `oplire install warp` to install WARP",
+                        "\n{} Run `oplirex install warp` to install WARP",
                         "Tip:".cyan().bold()
                     );
                 }
@@ -1161,7 +1658,7 @@ fn main() {
 
             println!("{}", "Checking tunnel status...".dimmed());
 
-            match run_command("warp-cli", &["status"], cli.dry_run, cli.verbose) {
+            match run_warp_cli(&["status"], cli.dry_run, cli.verbose) {
                 Ok(output) => {
                     let status_str = output.trim();
                     let connected =
@@ -1211,7 +1708,7 @@ fn main() {
         Commands::Reset {} => {
             if !warp_installed {
                 println!("{} WARP is not installed", "[ERROR]".red());
-                println!("{} Run `oplire install warp` first", "Tip:".cyan().bold());
+                println!("{} Run `oplirex install warp` first", "Tip:".cyan().bold());
                 return;
             }
 
@@ -1220,32 +1717,33 @@ fn main() {
             if cli.verbose {
                 eprintln!("{} Step 1: Disconnecting...", "[DEBUG]".cyan());
             }
-            let _ = run_command("warp-cli", &["disconnect"], cli.dry_run, cli.verbose);
+            let _ = run_warp_cli(&["disconnect"], cli.dry_run, cli.verbose);
 
-            if cli.verbose {
-                eprintln!("{} Step 2: Stopping warp-svc...", "[DEBUG]".cyan());
-            }
-            let _ = run_sudo_command("systemctl stop warp-svc", cli.dry_run, cli.verbose);
+            if !is_windows() {
+                if cli.verbose {
+                    eprintln!("{} Step 2: Stopping warp-svc...", "[DEBUG]".cyan());
+                }
+                let _ = run_sudo_command("systemctl stop warp-svc", cli.dry_run, cli.verbose);
 
-            if cli.verbose {
-                eprintln!("{} Step 3: Clearing cache...", "[DEBUG]".cyan());
-            }
-            let _ = run_sudo_command(
-                "rm -rf /var/lib/cloudflare-warp/*",
-                cli.dry_run,
-                cli.verbose,
-            );
+                if cli.verbose {
+                    eprintln!("{} Step 3: Clearing cache...", "[DEBUG]".cyan());
+                }
+                let _ = run_sudo_command(
+                    "rm -rf /var/lib/cloudflare-warp/*",
+                    cli.dry_run,
+                    cli.verbose,
+                );
 
-            if cli.verbose {
-                eprintln!("{} Step 4: Starting warp-svc...", "[DEBUG]".cyan());
+                if cli.verbose {
+                    eprintln!("{} Step 4: Starting warp-svc...", "[DEBUG]".cyan());
+                }
+                let _ = run_sudo_command("systemctl start warp-svc", cli.dry_run, cli.verbose);
             }
-            let _ = run_sudo_command("systemctl start warp-svc", cli.dry_run, cli.verbose);
 
             if cli.verbose {
                 eprintln!("{} Step 5: Registering new tunnel...", "[DEBUG]".cyan());
             }
-            let _ = run_command(
-                "warp-cli",
+            let _ = run_warp_cli(
                 &["registration", "new"],
                 cli.dry_run,
                 cli.verbose,
@@ -1254,16 +1752,16 @@ fn main() {
             if cli.verbose {
                 eprintln!("{} Step 6: Connecting...", "[DEBUG]".cyan());
             }
-            let _ = run_command("warp-cli", &["connect"], cli.dry_run, cli.verbose);
+            let _ = run_warp_cli(&["connect"], cli.dry_run, cli.verbose);
 
             println!("{}", "WARP tunnel reset complete!".green().bold());
-            println!("{} Run `oplire status` to verify", "Tip:".cyan());
+            println!("{} Run `oplirex status` to verify", "Tip:".cyan());
         }
 
         Commands::Stop {} => {
             if !warp_installed {
                 println!("{} WARP is not installed", "[ERROR]".red());
-                println!("{} Run `oplire install warp` first", "Tip:".cyan().bold());
+                println!("{} Run `oplirex install warp` first", "Tip:".cyan().bold());
                 return;
             }
 
@@ -1272,20 +1770,22 @@ fn main() {
             if cli.verbose {
                 eprintln!("{} Step 1: Disconnecting...", "[DEBUG]".cyan());
             }
-            let _ = run_command("warp-cli", &["disconnect"], cli.dry_run, cli.verbose);
+            let _ = run_warp_cli(&["disconnect"], cli.dry_run, cli.verbose);
 
-            if cli.verbose {
-                eprintln!("{} Step 2: Stopping warp-svc...", "[DEBUG]".cyan());
-            }
-            let _ = run_sudo_command("systemctl stop warp-svc", cli.dry_run, cli.verbose);
+            if !is_windows() {
+                if cli.verbose {
+                    eprintln!("{} Step 2: Stopping warp-svc...", "[DEBUG]".cyan());
+                }
+                let _ = run_sudo_command("systemctl stop warp-svc", cli.dry_run, cli.verbose);
 
-            if cli.verbose {
-                eprintln!("{} Step 3: Disabling warp-svc...", "[DEBUG]".cyan());
+                if cli.verbose {
+                    eprintln!("{} Step 3: Disabling warp-svc...", "[DEBUG]".cyan());
+                }
+                let _ = run_sudo_command("systemctl disable warp-svc", cli.dry_run, cli.verbose);
             }
-            let _ = run_sudo_command("systemctl disable warp-svc", cli.dry_run, cli.verbose);
 
             println!("{}", "WARP tunnel stopped!".green().bold());
-            println!("{} Run `oplire reset` to restart", "Tip:".cyan());
+            println!("{} Run `oplirex reset` to restart", "Tip:".cyan());
         }
 
         Commands::About {} => {
@@ -1295,41 +1795,41 @@ fn main() {
             println!("{} Rust", "Language:".bold());
             println!("{} OpenCode rate limit reset + Anthropic proxy", "Purpose:".bold());
             println!("{} Cloudflare WARP + Axum HTTP", "Infrastructure:".bold());
-            println!("{} Berke Oruc", "Author:".bold());
+            println!("{} nxyy", "Author:".bold());
             println!(
-                "{} https://github.com/BerkeOruc/oplire",
+                "{} https://github.com/nxyystore/oplirex",
                 "GitHub:".bold()
             );
             println!();
             println!("{}", "Installation:".bold());
-            println!("  oplire install warp          # Install Cloudflare WARP");
-            println!("  oplire install opencode      # Install OpenCode");
-            println!("  oplire install claude-code   # Install Claude Code CLI");
-            println!("  oplire install all           # Install everything");
-            println!("  oplire setup                 # Guided setup wizard");
+            println!("  oplirex install warp          # Install Cloudflare WARP");
+            println!("  oplirex install opencode      # Install OpenCode");
+            println!("  oplirex install claude-code   # Install Claude Code CLI");
+            println!("  oplirex install all           # Install everything");
+            println!("  oplirex setup                 # Guided setup wizard");
             println!();
             println!("{}", "WARP Management:".bold());
-            println!("  oplire status              # Check WARP status");
-            println!("  oplire reset               # Full WARP tunnel reset");
-            println!("  oplire quick-reset         # Fast WARP IP rotation");
-            println!("  oplire stop                # Stop WARP tunnel");
+            println!("  oplirex status              # Check WARP status");
+            println!("  oplirex reset               # Full WARP tunnel reset");
+            println!("  oplirex quick-reset         # Fast WARP IP rotation");
+            println!("  oplirex stop                # Stop WARP tunnel");
             println!();
             println!("{}", "Proxy & Claude Code:".bold());
-            println!("  oplire proxy               # Start reverse proxy");
-            println!("  oplire connect claude-code # Proxy + launch Claude Code");
-            println!("  oplire daemon              # Background proxy service");
-            println!("  oplire watch               # Monitor OpenCode, auto-reset");
+            println!("  oplirex proxy               # Start reverse proxy");
+            println!("  oplirex connect claude-code # Proxy + launch Claude Code");
+            println!("  oplirex daemon              # Background proxy service");
+            println!("  oplirex watch               # Monitor OpenCode, auto-reset");
             println!();
             println!("{}", "Configuration:".bold());
-            println!("  oplire models              # List available OpenCode models");
-            println!("  oplire config show         # Show current config");
-            println!("  oplire config set          # Save config");
-            println!("  oplire config reset        # Reset to defaults");
-            println!("  oplire doctor              # Diagnose system setup");
+            println!("  oplirex models              # List available OpenCode models");
+            println!("  oplirex config show         # Show current config");
+            println!("  oplirex config set          # Save config");
+            println!("  oplirex config reset        # Reset to defaults");
+            println!("  oplirex doctor              # Diagnose system setup");
         }
     }
 
     if !matches!(&cli.command, Commands::About {} | Commands::Proxy { .. } | Commands::Connect { .. } | Commands::Daemon { .. } | Commands::Watch { .. } | Commands::Doctor {} | Commands::Config { .. } | Commands::Setup {} | Commands::Install { .. } | Commands::Models { .. }) {
-        println!("\n{} v{}", "oplire".bold(), VERSION.dimmed());
+        println!("\n{} v{}", "oplirex".bold(), VERSION.dimmed());
     }
 }

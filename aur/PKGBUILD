@@ -1,17 +1,20 @@
 # Maintainer: Berke Oruc <berke@oruc.dev>
 # Contributor: Berke Oruc <berke@oruc.dev>
 
-pkgname=oplire
-pkgver=2.4.0
+pkgname=oplirex
+pkgver=1.0.0
 pkgrel=1
-pkgdesc="OpenCode Limit Reset + Anthropic Proxy Bridge - Reverse proxy for Claude Code with auto WARP rate limit reset"
+pkgdesc="Proxy for OpenCode rate limits, plus a local proxy that adds free models to Claude Code."
 arch=('x86_64')
-url="https://github.com/BerkeOruc/oplire"
+url="https://github.com/nxyystore/oplirex"
 license=('MIT')
 makedepends=('cargo')
 depends=('glibc')
 optdepends=('cloudflare-warp-bin: for WARP tunnel rate limit reset functionality')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/BerkeOruc/oplire/archive/v$pkgver.tar.gz")
+# Source is tagged on nxyystore/oplirex (canonical release repo via cargo-dist).
+# After pushing each release tag, replace 'SKIP' with the real checksum:
+#   curl -sL "https://github.com/nxyystore/oplirex/archive/v$pkgver.tar.gz" | sha256sum
+source=("$pkgname-$pkgver.tar.gz::https://github.com/nxyystore/oplirex/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {
@@ -21,7 +24,7 @@ build() {
 
 package() {
     cd "$pkgname-$pkgver"
-    install -Dm755 target/release/oplire "$pkgdir/usr/bin/oplire"
+    install -Dm755 target/release/$pkgname "$pkgdir/usr/bin/$pkgname"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# oplire-reset Linux Installer
+# oplirex Linux Installer
 # Installs Cloudflare WARP on Linux
 
 set -e

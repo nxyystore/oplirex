@@ -1,0 +1,21 @@
+name: Publish to WinGet
+
+# Runs after each non-draft GitHub Release (created by release.yml on v* tags)
+# and opens an auto-generated manifest PR against microsoft/winget-pkgs.
+# Requires a classic PAT with public_repo + workflow scopes as repo secret WINGET_TOKEN,
+# plus a fork of microsoft/winget-pkgs under the same account as this repo.
+
+on:
+  release:
+    types: [released]
+
+jobs:
+  publish:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@main
+        with:
+          identifier: nxyystore.oplirex
+          installers-regex: '\.zip$'
+          max-versions-to-keep: 5
+          token: ${{ secrets.WINGET_TOKEN }}

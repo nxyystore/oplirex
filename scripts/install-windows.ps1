@@ -1,4 +1,4 @@
-# oplire-reset Windows Installer
+# oplirex Windows Installer
 # Installs Cloudflare WARP on Windows
 
 param(
